@@ -1,0 +1,82 @@
+# Rolling release: every push to main rebuilds Linux/Windows/macOS binaries
+# and publishes them to ONE release tagged `latest`. Old builds are deleted,
+# so storage never accumulates — only the newest version exists.
+#
+# The crate itself is OS-agnostic by construction: std + memmap2 + rayon only,
+# x86-64 SIMD behind `cfg(target_arch)` with scalar fallback, no GPU code.
+# Default build on every OS is the same lean CPU binary.
+
+name: rolling-release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: rust-llama
+            archive: rust-llama-linux-x86_64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: rust-llama.exe
+            archive: rust-llama-windows-x86_64.zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: rust-llama
+            archive: rust-llama-macos-arm64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test --release --target ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.archive }} ${{ matrix.bin }}
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../${{ matrix.archive }} ${{ matrix.bin }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout gives gh + git a real repo, authenticated origin and the
+      # commit the `latest` tag will point at (no empty commits, no token URLs).
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: replace rolling release (only newest is kept)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --cleanup-tag --yes || true
+          git tag -f latest
+          git push -qf origin latest
+          gh release create latest --title "Latest build" \
+            --notes "Rolling build from main ($(date -u +%Y-%m-%d)). Previous builds are deleted; only this version is kept." \
+            dist/*
