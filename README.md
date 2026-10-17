@@ -49,7 +49,7 @@ Throughput means nothing if the math is wrong. Every hot kernel is tested
 against a scalar reference, and the whole engine is differential-tested
 against llama.cpp on identical files: **byte-identical greedy completions on
 2/4 prompts** (world capitals), fluent-and-valid on the other two where
-creative text legitimately diverges after the same prefix. 26 unit tests, all
+creative text legitimately diverges after the same prefix. 31 unit tests, all
 green, run with `cargo test --release`.
 
 Robustness is tested too: malformed GGUF files fail loudly with an error —
@@ -74,14 +74,16 @@ servers are first-class targets — not afterthoughts.
   QK-norm, RMSNorm, tied embeddings, KV cache.
 - **Hand-written AVX2+FMA kernels** — fused dequant-dot, integer Q×Q8 dots,
   RMSNorm, batched prefill matmuls — runtime-dispatched with portable scalar
-  fallback (`RUST_LLAMA_NO_SIMD=1`). 26 unit tests, all green.
+  fallback (`RUST_LLAMA_NO_SIMD=1`). 31 unit tests, all green.
 - **Byte-level BPE** straight from the GGUF file (no network, no downloads).
-- **Sampling** — temperature, top-k, top-p, repetition penalty.
+- **Sampling** — temperature, top-k, top-p, repetition penalty (windowed,
+  once-per-token, matching llama.cpp semantics).
 - **`prune-vocab`** — drop unneeded scripts and shrink embedding tables:
   vocab 151,936 → 109,051, file −82 MB, *byte-identical greedy output*.
 - **`serve`** — OpenAI-compatible HTTP API (`/health`, `/v1/chat/completions`,
   `/v1/completions`, SSE streaming), standard library only.
-- **`bench` / `profile` / `info`** — throughput, per-matmul breakdown, inspection.
+- **`bench` / `profile` / `info` / `tokenize`** — throughput, per-matmul
+  breakdown, inspection, and token-id dumps for reference diffing.
 
 ## Model support philosophy: narrow and verified
 

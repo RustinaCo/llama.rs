@@ -17,6 +17,7 @@ struct Args {
     top_k: usize,
     top_p: f32,
     repeat_penalty: f32,
+    repeat_last_n: usize,
     threads: usize,
     ctx: usize,
     seed: u64,
@@ -41,6 +42,7 @@ impl Default for Args {
             top_k: 40,
             top_p: 0.95,
             repeat_penalty: 1.1,
+            repeat_last_n: 64,
             threads: 0,
             ctx: 2048,
             seed: 0x1234_5678_9abc_def0,
@@ -62,6 +64,7 @@ USAGE:
     rust-llama run <model.gguf> [options]
     rust-llama bench <model.gguf> [options]
     rust-llama info <model.gguf>
+    rust-llama tokenize <model.gguf> -p <TEXT>   (print token ids, no chat template)
     rust-llama prune-vocab <model.gguf> --out <pruned.gguf>
     rust-llama serve <model.gguf> [--host H] [--port P] [sampling options]
     rust-llama profile <model.gguf> [-t N]   (per-matmul prefill breakdown)
@@ -74,6 +77,7 @@ OPTIONS (run):
         --top-k <N>           Top-k (default 40; 0 = disabled)
         --top-p <F>           Nucleus sampling (default 0.95)
         --repeat-penalty <F>  Repetition penalty (default 1.1)
+        --repeat-last-n <N>   Repetition-penalty window (default 64)
     -t, --threads <N>         CPU threads (default: all)
         --ctx <N>             KV-cache context size (default 2048)
         --seed <N>            RNG seed
@@ -130,6 +134,13 @@ fn parse_args() -> Args {
                     .get(i)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(a.repeat_penalty);
+            }
+            "--repeat-last-n" => {
+                i += 1;
+                a.repeat_last_n = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(a.repeat_last_n);
             }
             "-t" | "--threads" => {
                 i += 1;
@@ -193,6 +204,7 @@ fn main() {
 
     match args.cmd.as_str() {
         "info" => cmd_info(&model_path),
+        "tokenize" => cmd_tokenize(&args, &model_path),
         "run" | "" => cmd_run(&args, &model_path),
         "bench" => cmd_bench(&args, &model_path),
         "prune-vocab" => cmd_prune(&args, &model_path),
@@ -203,6 +215,24 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Print the model's token ids for `-p TEXT` (no chat template applied).
+///
+/// Exists so tokenization can be diffed against a reference (HF tokenizer /
+/// llama.cpp) without instrumenting the generation path.
+fn cmd_tokenize(args: &Args, path: &str) {
+    let model = match Model::load(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let text = args.prompt.clone().unwrap_or_default();
+    let ids = model.tok.encode(&text);
+    let joined: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+    println!("{}", joined.join(" "));
 }
 
 fn cmd_prune(args: &Args, path: &str) {
@@ -236,6 +266,7 @@ fn cmd_serve(args: &Args, path: &str) {
         top_k: args.top_k,
         top_p: args.top_p,
         repetition_penalty: args.repeat_penalty,
+        repeat_last_n: args.repeat_last_n,
         seed: args.seed,
     };
     eprintln!("serving {} on {}:{}", path, args.host, args.port);
@@ -364,6 +395,7 @@ fn cmd_run(args: &Args, path: &str) {
         top_k: args.top_k,
         top_p: args.top_p,
         repetition_penalty: args.repeat_penalty,
+        repeat_last_n: args.repeat_last_n,
         seed: args.seed,
     };
 

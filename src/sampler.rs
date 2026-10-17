@@ -6,6 +6,9 @@ pub struct SamplingParams {
     pub top_k: usize,
     pub top_p: f32,
     pub repetition_penalty: f32,
+    /// How many trailing tokens the repetition penalty looks at. Matches the
+    /// common `repeat-last-n` default; 0 disables the window (penalize all).
+    pub repeat_last_n: usize,
     pub seed: u64,
 }
 
@@ -16,6 +19,7 @@ impl Default for SamplingParams {
             top_k: 40,
             top_p: 0.95,
             repetition_penalty: 1.1,
+            repeat_last_n: 64,
             seed: 0x1234_5678_9abc_def0,
         }
     }
@@ -57,16 +61,31 @@ impl Sampler {
         let mut probs: Vec<f32> = logits.to_vec();
 
         // repetition penalty
+        //
+        // Reference semantics (llama.cpp / OpenAI): look only at the last
+        // `repeat_last_n` tokens and penalize each DISTINCT token at most
+        // once. Penalizing the whole history — or multiplying the penalty by
+        // the number of occurrences — drives the model off-distribution on
+        // long prompts (it starts avoiding every token the prompt contains
+        // and drifts into foreign scripts).
         if params.repetition_penalty != 1.0 {
-            for &t in recent {
+            let p = params.repetition_penalty;
+            let start = if params.repeat_last_n == 0 {
+                0
+            } else {
+                recent.len().saturating_sub(params.repeat_last_n)
+            };
+            let mut seen: Vec<u32> = Vec::with_capacity(recent.len() - start);
+            for &t in &recent[start..] {
                 let i = t as usize;
-                if i < n {
-                    let p = params.repetition_penalty;
-                    if probs[i] > 0.0 {
-                        probs[i] /= p;
-                    } else {
-                        probs[i] *= p;
-                    }
+                if i >= n || seen.contains(&t) {
+                    continue;
+                }
+                seen.push(t);
+                if probs[i] > 0.0 {
+                    probs[i] /= p;
+                } else {
+                    probs[i] *= p;
                 }
             }
         }
@@ -130,5 +149,48 @@ impl Sampler {
             }
         }
         idx[idx.len() - 1] as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn greedy_params(penalty: f32, last_n: usize) -> SamplingParams {
+        SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: penalty,
+            repeat_last_n: last_n,
+            seed: 1,
+        }
+    }
+
+    #[test]
+    fn repetition_penalty_applies_once_per_distinct_token() {
+        // token 0 seen 4x; penalizing per-occurrence would give 10 / 2^4 = 0.625
+        // and flip the argmax to token 1. One penalty keeps it at 5.0.
+        let logits = vec![10.0f32, 1.0];
+        let recent = vec![0u32, 0, 0, 0];
+        let mut s = Sampler::new(1);
+        assert_eq!(s.sample(&logits, &greedy_params(2.0, 64), &recent), 0);
+    }
+
+    #[test]
+    fn repetition_penalty_respects_window() {
+        let logits = vec![10.0f32, 1.0];
+        let mut s = Sampler::new(1);
+        // token 0 inside the 2-token window -> 10 / 20 = 0.5 -> token 1 wins
+        assert_eq!(s.sample(&logits, &greedy_params(20.0, 2), &[7, 7, 0]), 1);
+        // token 0 pushed out of the window -> untouched -> token 0 wins
+        assert_eq!(s.sample(&logits, &greedy_params(20.0, 2), &[0, 7, 7]), 0);
+    }
+
+    #[test]
+    fn repetition_penalty_disabled_is_identity() {
+        let logits = vec![10.0f32, 1.0];
+        let mut s = Sampler::new(1);
+        assert_eq!(s.sample(&logits, &greedy_params(1.0, 64), &[0, 0, 0]), 0);
     }
 }

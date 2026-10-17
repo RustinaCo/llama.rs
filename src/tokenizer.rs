@@ -177,6 +177,34 @@ impl Tokenizer {
                 end = i + 1;
             }
 
+            // alt4: ' ?[^\s\p{L}\p{N}]+[\r\n]*'
+            //
+            // ORDER MATTERS: the Qwen2/GPT-2 pattern tests this BEFORE the
+            // whitespace alternatives, and it may swallow ONE leading space.
+            // Splitting " ," as " " + "," (whitespace first) instead of " ,"
+            // changes the per-piece BPE result, so the model would be fed a
+            // different token stream than every reference implementation.
+            if end == 0 {
+                let mut j = i;
+                if chars[j].1 == ' ' && i + 1 < n {
+                    j += 1;
+                }
+                let mid = j;
+                while j < n
+                    && !is_space(chars[j].1)
+                    && !is_letter(chars[j].1)
+                    && !is_number(chars[j].1)
+                {
+                    j += 1;
+                }
+                if j > mid {
+                    while j < n && (chars[j].1 == '\r' || chars[j].1 == '\n') {
+                        j += 1;
+                    }
+                    end = j;
+                }
+            }
+
             // alt5: \s*[\r\n]+
             if end == 0 && is_space(c) {
                 let mut j = i;
@@ -203,28 +231,6 @@ impl Tokenizer {
                     } else {
                         end = run;
                     }
-                }
-            }
-
-            // alt4: ' ?[^\s\p{L}\p{N}]+[\r\n]*'
-            if end == 0 && !is_letter(c) && !is_number(c) && !is_space(c) {
-                let mut j = i;
-                if chars[j].1 == ' ' {
-                    j += 1;
-                }
-                let mid = j;
-                while j < n
-                    && !is_space(chars[j].1)
-                    && !is_letter(chars[j].1)
-                    && !is_number(chars[j].1)
-                {
-                    j += 1;
-                }
-                if j > mid {
-                    while j < n && (chars[j].1 == '\r' || chars[j].1 == '\n') {
-                        j += 1;
-                    }
-                    end = j;
                 }
             }
 
@@ -377,8 +383,7 @@ pub fn decode_token_bytes(s: &str) -> Vec<u8> {
 }
 
 /// Minimal Qwen3 chat prompt formatter.
-pub fn format_qwen_chat(prompt: &str, system: Option<&str>, no_think: bool) -> String {
-    let mut s = String::new();
+pub fn format_qwen_chat(prompt: &str, system: Option<&str>, no_think: bool) -> String {    let mut s = String::new();
     if let Some(sys) = system {
         s.push_str("<|im_start|>system\n");
         s.push_str(sys);
@@ -391,4 +396,32 @@ pub fn format_qwen_chat(prompt: &str, system: Option<&str>, no_think: bool) -> S
         s.push_str("<think>\n\n</think>\n\n");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy() -> Tokenizer {
+        Tokenizer::new(vec!["x".to_string()], &[], vec![], 0, 0)
+    }
+
+    #[test]
+    fn pretokenize_swallows_space_before_punct() {
+        // Regression: the Qwen2/GPT-2 pattern tries ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+        // BEFORE the whitespace alternatives, so a space immediately before
+        // punctuation belongs to the same piece. Splitting it as " " + "," (the
+        // old behaviour) changes per-piece BPE and desyncs us from every
+        // reference tokenizer, which feeds the model the wrong tokens.
+        let t = dummy();
+        assert_eq!(t.pretokenize("a ,b"), vec!["a", " ,", "b"]);
+        assert_eq!(t.pretokenize("x (y)"), vec!["x", " (", "y", ")"]);
+    }
+
+    #[test]
+    fn pretokenize_keeps_plain_tokens_whole() {
+        let t = dummy();
+        assert_eq!(t.pretokenize("hello world"), vec!["hello", " world"]);
+        assert_eq!(t.pretokenize("a\n\n b"), vec!["a", "\n\n", " b"]);
+    }
 }
