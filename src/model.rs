@@ -3,6 +3,8 @@
 use std::io;
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use crate::gguf::{GgufFile, TensorInfo};
 use crate::ops;
 use crate::sampler::{Sampler, SamplingParams};
@@ -401,7 +403,6 @@ impl Model {
         let mut attn_all = vec![0f32; n * q_dim];
         let mut gate_all = vec![0f32; n * n_ff];
         let mut up_all = vec![0f32; n * n_ff];
-        let mut scores = vec![0f32; start_pos + n];
         let scale = 1.0 / (hd as f32).sqrt();
         let group = (n_head / n_kv).max(1);
 
@@ -461,28 +462,44 @@ impl Model {
                     .copy_from_slice(&v_all[i * kv_dim..(i + 1) * kv_dim]);
             }
 
-            for i in 0..n {
-                let t = start_pos + i + 1;
-                for h in 0..n_head {
-                    let kv = h / group;
-                    let qh = &q_all[i * q_dim + h * hd..i * q_dim + h * hd + hd];
-                    for j in 0..t {
-                        let base = j * kv_dim + kv * hd;
-                        let kj = &kcache[l][base..base + hd];
-                        scores[j] = ops::dot(qh, kj) * scale;
+            // Attention over the prompt, one query position per task.
+            //
+            // Each query row is attended independently and each (head, query)
+            // pair reads its own K/V slice, so the work is embarrassingly
+            // parallel. It used to run on ONE thread, which made prefill
+            // bandwidth-bound at single-core speed (~5 GB/s) and dominate
+            // long-prompt latency (the loop is O(n^2)).
+            //
+            // Rows are split with `par_chunks_mut`, so every task owns a
+            // disjoint slice of `attn_all`; `kcache`/`vcache` are read-only
+            // here, and each task keeps a private score row. Arithmetic is
+            // unchanged, so results stay bit-identical.
+            let (kc, vc): (&[Vec<f32>], &[Vec<f32>]) = (&kcache[..], &vcache[..]);
+            attn_all.par_chunks_mut(q_dim).enumerate().for_each_init(
+                || vec![0f32; start_pos + n],
+                |scores, (i, ah_row)| {
+                    let t = start_pos + i + 1;
+                    for h in 0..n_head {
+                        let kv = h / group;
+                        let qh = &q_all[i * q_dim + h * hd..i * q_dim + h * hd + hd];
+                        for j in 0..t {
+                            let base = j * kv_dim + kv * hd;
+                            let kj = &kc[l][base..base + hd];
+                            scores[j] = ops::dot(qh, kj) * scale;
+                        }
+                        ops::softmax_inplace(&mut scores[..t]);
+                        let ah = &mut ah_row[h * hd..h * hd + hd];
+                        for a in ah.iter_mut() {
+                            *a = 0.0;
+                        }
+                        for j in 0..t {
+                            let base = j * kv_dim + kv * hd;
+                            let vj = &vc[l][base..base + hd];
+                            ops::saxpy(ah, scores[j], vj);
+                        }
                     }
-                    ops::softmax_inplace(&mut scores[..t]);
-                    let ah = &mut attn_all[i * q_dim + h * hd..i * q_dim + h * hd + hd];
-                    for a in ah.iter_mut() {
-                        *a = 0.0;
-                    }
-                    for j in 0..t {
-                        let base = j * kv_dim + kv * hd;
-                        let vj = &vcache[l][base..base + hd];
-                        ops::saxpy(ah, scores[j], vj);
-                    }
-                }
-            }
+                },
+            );
 
             ops::matmul_batch(&self.tensor(&lw.attn_output), &attn_all, n, &mut xb_all);
             for i in 0..n {
@@ -579,23 +596,58 @@ impl Model {
             kcache[l][o..o + kv_dim].copy_from_slice(&ws.k);
             vcache[l][o..o + kv_dim].copy_from_slice(&ws.v);
 
-            for h in 0..n_head {
-                let kv = h / group;
-                let qh = &ws.q[h * hd..(h + 1) * hd];
-                for j in 0..t {
-                    let base = j * kv_dim + kv * hd;
-                    let kj = &kcache[l][base..base + hd];
-                    ws.scores[j] = ops::dot(qh, kj) * scale;
-                }
-                ops::softmax_inplace(&mut ws.scores[..t]);
-                let ah = &mut ws.attn[h * hd..(h + 1) * hd];
-                for a in ah.iter_mut() {
-                    *a = 0.0;
-                }
-                for j in 0..t {
-                    let base = j * kv_dim + kv * hd;
-                    let vj = &vcache[l][base..base + hd];
-                    ops::saxpy(ah, ws.scores[j], vj);
+            // Attention for this token.
+            //
+            // Heads are independent here (each reads its own K/V slice and
+            // writes its own `attn` slice), so above a small work threshold we
+            // spread them over the thread pool. The loop is O(context), so
+            // running it on one core made every generated token after a long
+            // prompt single-core bandwidth-bound (~5 GB/s).
+            //
+            // Arithmetic per (head, position) is unchanged, so results stay
+            // bit-identical.
+            if t * n_head >= 1024 {
+                let qs: &[f32] = &ws.q;
+                let kc: &[Vec<f32>] = &kcache[..];
+                let vc: &[Vec<f32>] = &vcache[..];
+                ws.attn.par_chunks_mut(hd).enumerate().for_each_init(
+                    || vec![0f32; t],
+                    |scores, (h, ah)| {
+                        let kv = h / group;
+                        let qh = &qs[h * hd..h * hd + hd];
+                        for j in 0..t {
+                            let base = j * kv_dim + kv * hd;
+                            scores[j] = ops::dot(qh, &kc[l][base..base + hd]) * scale;
+                        }
+                        ops::softmax_inplace(&mut scores[..t]);
+                        for a in ah.iter_mut() {
+                            *a = 0.0;
+                        }
+                        for j in 0..t {
+                            let base = j * kv_dim + kv * hd;
+                            ops::saxpy(ah, scores[j], &vc[l][base..base + hd]);
+                        }
+                    },
+                );
+            } else {
+                for h in 0..n_head {
+                    let kv = h / group;
+                    let qh = &ws.q[h * hd..(h + 1) * hd];
+                    for j in 0..t {
+                        let base = j * kv_dim + kv * hd;
+                        let kj = &kcache[l][base..base + hd];
+                        ws.scores[j] = ops::dot(qh, kj) * scale;
+                    }
+                    ops::softmax_inplace(&mut ws.scores[..t]);
+                    let ah = &mut ws.attn[h * hd..(h + 1) * hd];
+                    for a in ah.iter_mut() {
+                        *a = 0.0;
+                    }
+                    for j in 0..t {
+                        let base = j * kv_dim + kv * hd;
+                        let vj = &vcache[l][base..base + hd];
+                        ops::saxpy(ah, ws.scores[j], vj);
+                    }
                 }
             }
 

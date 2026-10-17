@@ -90,6 +90,14 @@ pub struct Q8Row {
     pub scales: Vec<f32>,
     pub qs: Vec<i8>,
     pub sums: Vec<i32>,
+    /// Sum of each 16-value half of a 32-byte block: `sums16[2*b + h]`.
+    ///
+    /// The `Q6_K` kernel consumes 16-value halves, so its per-row loop needs
+    /// these. Computing them here (once per activation) instead of inside the
+    /// row loop removes a scalar re-sum of the activation from every weight
+    /// row — that sum is identical for all rows and used to dominate the
+    /// `Q6_K` kernel.
+    pub sums16: Vec<i32>,
 }
 
 /// Portable scalar activation quantization (exact output, any CPU).
@@ -98,6 +106,7 @@ pub fn quantize_q8(x: &[f32]) -> Q8Row {
     let mut scales = Vec::with_capacity(nb);
     let mut qs = Vec::with_capacity(nb * 32);
     let mut sums = Vec::with_capacity(nb);
+    let mut sums16 = Vec::with_capacity(nb * 2);
     for b in 0..nb {
         let blk = &x[b * 32..b * 32 + 32];
         let mut amax = 0f32;
@@ -111,14 +120,25 @@ pub fn quantize_q8(x: &[f32]) -> Q8Row {
         let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
         scales.push(d);
         let mut s = 0i32;
-        for &v in blk {
+        let mut s_lo = 0i32;
+        for (i, &v) in blk.iter().enumerate() {
             let q = (v * inv).round().clamp(-128.0, 127.0) as i8;
             s += q as i32;
+            if i < 16 {
+                s_lo += q as i32;
+            }
             qs.push(q);
         }
         sums.push(s);
+        sums16.push(s_lo);
+        sums16.push(s - s_lo);
     }
-    Q8Row { scales, qs, sums }
+    Q8Row {
+        scales,
+        qs,
+        sums,
+        sums16,
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -523,22 +543,16 @@ unsafe fn dot_q6k_q8_avx2(src: &[u8], act: &Q8Row) -> f32 {
                 let a2 = _mm_loadu_si128(aq.add((ab + 1) * 32 + o) as *const __m128i);
                 let a3 = _mm_loadu_si128(aq.add((ab + 2) * 32 + o) as *const __m128i);
                 let a4 = _mm_loadu_si128(aq.add((ab + 3) * 32 + o) as *const __m128i);
-                let mut sa = [0i32; 4];
-                let mut ss = [0i32; 4];
                 let us = [u1, u2, u3, u4];
                 let aa = [a1, a2, a3, a4];
-                for c in 0..4 {
-                    ss[c] = hsum_i32_128(_mm_madd_epi16(_mm_maddubs_epi16(us[c], aa[c]), ones));
-                    let mut t = 0i32;
-                    for i in 0..16 {
-                        t += *aq.add((ab + c) * 32 + o + i) as i32;
-                    }
-                    sa[c] = t;
-                }
                 let scs = [s1, s2, s3, s4];
                 for c in 0..4 {
+                    let ss = hsum_i32_128(_mm_madd_epi16(_mm_maddubs_epi16(us[c], aa[c]), ones));
+                    // 16-value half-block sum: precomputed in `quantize_q8`
+                    // (identical integer sum, so the dot stays bit-exact).
+                    let sa = act.sums16[(ab + c) * 2 + sub];
                     let da = act.scales[ab + c];
-                    total += d * scs[c] * (ss[c] as f32 - 32.0 * sa[c] as f32) * da;
+                    total += d * scs[c] * (ss as f32 - 32.0 * sa as f32) * da;
                 }
             }
         }
@@ -1008,13 +1022,19 @@ mod tests {
         assert_eq!(q.qs.len(), n);
         for b in 0..8 {
             let mut s = 0i32;
+            let mut s_lo = 0i32;
             let mut max_err = 0f32;
             for i in 0..32 {
                 s += q.qs[b * 32 + i] as i32;
+                if i < 16 {
+                    s_lo += q.qs[b * 32 + i] as i32;
+                }
                 let back = q.qs[b * 32 + i] as f32 * q.scales[b];
                 max_err = max_err.max((back - x[b * 32 + i]).abs());
             }
             assert_eq!(s, q.sums[b], "block {b} sum");
+            assert_eq!(s_lo, q.sums16[b * 2], "block {b} low half sum");
+            assert_eq!(s - s_lo, q.sums16[b * 2 + 1], "block {b} high half sum");
             assert!(max_err <= q.scales[b] * 0.5 + 1e-6, "block {b} err {max_err}");
         }
     }
