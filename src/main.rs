@@ -67,7 +67,7 @@ USAGE:
     rust-llama tokenize <model.gguf> -p <TEXT>   (print token ids, no chat template)
     rust-llama prune-vocab <model.gguf> --out <pruned.gguf>
     rust-llama serve <model.gguf> [--host H] [--port P] [sampling options]
-    rust-llama profile <model.gguf> [-t N]   (per-matmul prefill breakdown)
+    rust-llama profile <model.gguf> [-t N] [-n TOKENS]   (per-matmul prefill breakdown)
 
 OPTIONS (run):
     -p, --prompt <TEXT>       Prompt text
@@ -290,7 +290,15 @@ fn cmd_profile(args: &Args, path: &str) {
             std::process::exit(1);
         }
     };
-    let n = 13usize;
+    // `-n` overrides the profiled batch size; without it, keep the historical
+    // N=13 prefill shape that the row-per-token multipliers below assume.
+    // (`max_tokens` defaults to 256 for generation, hence the comparison.)
+    const DEFAULT_N: usize = 13;
+    let n = if args.max_tokens == Args::default().max_tokens {
+        DEFAULT_N
+    } else {
+        args.max_tokens.max(1)
+    };
     let reps = 5usize;
     // (label, tensor name, times-per-prefill-token-layer)
     let shapes = [

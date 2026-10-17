@@ -645,6 +645,88 @@ pub unsafe fn dot_multi(
     }
 }
 
+/// Fused multi-row × multi-token dot.
+///
+/// Dots `cnt` (1..=`RB`) dequantized rows held in `bufs` (`RB` rows of `cols`
+/// f32) against `n` activation rows in `xs`, in a single pass over the
+/// activations: each activation vector is loaded once and reused for every row
+/// in the block, so the activation traffic drops from `rows` passes to
+/// `rows / RB`.
+///
+/// The arithmetic is **identical** to calling [`dot_multi`] once per row: every
+/// output keeps the same reduction order (sequential 8-lane FMA chain over the
+/// row, then the scalar tail, then `hsum + tail`), and trailing tokens fall
+/// back to the same [`dot_f32_avx2`] `dot_multi` uses. Only the loop nesting
+/// changes. `TB` must be 4 for the results to match `dot_multi` exactly: then
+/// the trailing tokens (`n % 4`) are the ones `dot_multi` also leaves to
+/// `dot_f32_avx2`, so every output takes the same path.
+///
+/// Outputs are accumulated (`+=`), so the caller must zero `out` first (as
+/// `matmul_batch` does).
+///
+/// # Safety
+///
+/// `available()` must hold. `bufs` must hold at least `RB * cols` elements,
+/// `xs` at least `n * cols`, and for every `k < n` and `r < cnt` the address
+/// `out + k * out_stride + r` must be valid and writable by this thread alone.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_multi_rows<const RB: usize, const TB: usize>(
+    bufs: &[f32],
+    cols: usize,
+    xs: &[f32],
+    n: usize,
+    cnt: usize,
+    out: *mut f32,
+    out_stride: usize,
+) {
+    debug_assert!(cols > 0 && cols % 8 == 0);
+    debug_assert!(cnt >= 1 && cnt <= RB);
+    debug_assert!(bufs.len() >= RB * cols);
+    let wp = bufs.as_ptr();
+    let xp = xs.as_ptr();
+    let mut k = 0;
+    while k + TB <= n {
+        let mut acc = [[_mm256_setzero_ps(); TB]; RB];
+        let mut i = 0;
+        while i + 8 <= cols {
+            let mut xv = [_mm256_setzero_ps(); TB];
+            for (t, x) in xv.iter_mut().enumerate() {
+                *x = _mm256_loadu_ps(xp.add((k + t) * cols + i));
+            }
+            for r in 0..RB {
+                let w = _mm256_loadu_ps(wp.add(r * cols + i));
+                for t in 0..TB {
+                    acc[r][t] = _mm256_fmadd_ps(w, xv[t], acc[r][t]);
+                }
+            }
+            i += 8;
+        }
+        for r in 0..cnt {
+            for t in 0..TB {
+                let mut a = 0f32;
+                let mut j = i;
+                while j < cols {
+                    a += *wp.add(r * cols + j) * *xp.add((k + t) * cols + j);
+                    j += 1;
+                }
+                *out.add((k + t) * out_stride + r) += hsum(acc[r][t]) + a;
+            }
+        }
+        k += TB;
+    }
+    while k < n {
+        for r in 0..cnt {
+            let v = dot_f32_avx2(
+                bufs.get_unchecked(r * cols..r * cols + cols),
+                xs.get_unchecked(k * cols..k * cols + cols),
+            );
+            *out.add(k * out_stride + r) += v;
+        }
+        k += 1;
+    }
+}
+
 /// Integer-exact `Q4_0` × int8-activation dot (18-byte blocks).
 ///
 /// Values are `nibble - 8`: `Σ(u-8)*a = Σu*a - 8*Σa` with the first term
@@ -1225,6 +1307,71 @@ mod tests {
             let s: f32 = buf.iter().zip(&xs[k * cols..k * cols + cols]).map(|(a, b)| a * b).sum();
             let denom = s.abs().max(1.0);
             assert!((got[k] - s).abs() / denom < 1e-4, "k={k}: {} vs {s}", got[k]);
+        }
+    }
+
+    #[test]
+    fn dot_multi_rows_matches_serial_bits() {
+        // The row-blocked kernel must be *bit*-identical to one-row-at-a-time
+        // `dot_multi`: blocking only reorders loops, never the reduction order
+        // of any single output. Covers the token tail (n % TB), a partial row
+        // block (rows % RB), and the 8-wide/scalar tails of `cols`.
+        if !available() {
+            return;
+        }
+        // The engine's shipped split. `TB` must be 4 for exactness (see the
+        // kernel docs); the row/token tails are exercised below.
+        const RB: usize = 3;
+        const TB: usize = 4;
+        let mut rng = Lcg(0x5eed_1234);
+        for cols in [1024usize, 3072] {
+            for n in [1usize, 2, 3, 5, 13, 32] {
+                for rows in [1usize, 3, 4, 5, 9, 11] {
+                    let xs: Vec<f32> = (0..n * cols).map(|_| rng.f32()).collect();
+                    let w: Vec<f32> = (0..rows * cols).map(|_| rng.f32()).collect();
+                    let mut want = vec![0f32; n * rows];
+                    let mut got = vec![0f32; n * rows];
+                    unsafe {
+                        for r in 0..rows {
+                            dot_multi(
+                                &w[r * cols..(r + 1) * cols],
+                                &xs,
+                                0,
+                                cols,
+                                n,
+                                want.as_mut_ptr().add(r),
+                                rows,
+                            );
+                        }
+                        let mut bufs = vec![0f32; RB * cols];
+                        let mut r = 0;
+                        while r < rows {
+                            let cnt = (rows - r).min(RB);
+                            bufs[..cnt * cols].copy_from_slice(&w[r * cols..(r + cnt) * cols]);
+                            for j in cnt..RB {
+                                bufs[j * cols..(j + 1) * cols].fill(0.0);
+                            }
+                            dot_multi_rows::<RB, TB>(
+                                &bufs,
+                                cols,
+                                &xs,
+                                n,
+                                cnt,
+                                got.as_mut_ptr().add(r),
+                                rows,
+                            );
+                            r += cnt;
+                        }
+                    }
+                    for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "cols={cols} n={n} rows={rows} idx={i}: {a} vs {b}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

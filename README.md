@@ -5,7 +5,7 @@ binary, 2 dependencies, zero C toolchain.**
 
 `rust-llama` runs modern quantized GGUF models (Qwen3 family and friends) on
 ordinary CPUs — Linux, Windows and macOS — with competitive speed, a tiny
-footprint, and readable code (~6,000 lines) you can actually hack on. It also ships engine-side
+footprint, and readable code (~6,400 lines) you can actually hack on. It also ships engine-side
 tooling: vocabulary pruning, an OpenAI-compatible HTTP server, and
 benchmarks.
 
@@ -21,8 +21,8 @@ benchmarks.
 |---|---|---|
 | Binary size | **~1 MB, single file** | ~9.4 MB (binary + 6 shared libs) + full C++ built at compile time |
 | Dependencies | **2 crates** (`memmap2`, `rayon`) | C/C++ toolchain, libclang, CMake, tokio stack… |
-| Generation speed (Qwen3-0.6B-Q4_K_M, i5-10500, 12 threads) | **~21–32 tok/s (≈70–100%)** | ~22–43 tok/s |
-| Prompt processing | ~85–120 tok/s (≈45–90%) | ~120–300 tok/s |
+| Generation speed (Qwen3-0.6B-Q4_K_M, i5-10500, 12 threads) | **~24–29 tok/s (≈65–75%)** | ~36–39 tok/s |
+| Prompt processing | **~190–270 tok/s (≈45–55%)** | ~410–470 tok/s |
 | Peak RAM, same workload | **~450 MB** | ~4.4 GB |
 | Architectures | Qwen3 / Llama family (focused) | dozens (general) |
 | GPU | CPU-only by design | yes |
@@ -31,13 +31,12 @@ benchmarks.
 *Measured same-session, same model/prompt/threads; absolute numbers vary with
 machine state — the ratios above held across repeated sessions.*
 
-### Per-quantization throughput (Qwen3-0.6B, i5-10500, 12 threads, `-n 48`)
+### Per-quantization throughput (Qwen3-0.6B, i5-10500, `-t 12`, 48-token prompt, `-n 32`)
 
 | Weights | File | Prompt | Generation |
 |---|---|---|---|
-| Q4_K_M | 462 MB | 124.5 tok/s | 28.3 tok/s |
-| Q8_0 | 610 MB | 90.3 tok/s | 20.5 tok/s |
-| F32 | 2279 MB | 46.3 tok/s | 6.7 tok/s |
+| Q4_K_M | 462 MB | 262 tok/s | 29.3 tok/s |
+| Q8_0 | 610 MB | 220 tok/s | 20.8 tok/s |
 
 Smaller quants win twice: less memory traffic per token, and (after vocabulary
 pruning) fewer logits. Differential-tested against llama.cpp: byte-identical
@@ -49,7 +48,7 @@ Throughput means nothing if the math is wrong. Every hot kernel is tested
 against a scalar reference, and the whole engine is differential-tested
 against llama.cpp on identical files: **byte-identical greedy completions on
 2/4 prompts** (world capitals), fluent-and-valid on the other two where
-creative text legitimately diverges after the same prefix. 31 unit tests, all
+creative text legitimately diverges after the same prefix. 32 unit tests, all
 green, run with `cargo test --release`.
 
 Robustness is tested too: malformed GGUF files fail loudly with an error —
@@ -72,9 +71,10 @@ servers are first-class targets — not afterthoughts.
 - **Quantizations** — `F32/F16/BF16`, `Q4_0/Q4_1/Q5_0/Q5_1`, `Q8_0`, `Q4_K/Q5_K/Q6_K`.
 - **Modern transformer** — GQA, NeoX RoPE (precomputed), SwiGLU, per-head
   QK-norm, RMSNorm, tied embeddings, KV cache.
-- **Hand-written AVX2+FMA kernels** — fused dequant-dot, integer Q×Q8 dots,
-  RMSNorm, batched prefill matmuls — runtime-dispatched with portable scalar
-  fallback (`RUST_LLAMA_NO_SIMD=1`). 31 unit tests, all green.
+- **Hand-written AVX2+FMA kernels** — fused dequant-dot, row-blocked batched
+  prefill matmuls (each activation vector feeds several weight rows in one
+  pass), integer Q×Q8 dots, RMSNorm — runtime-dispatched with portable scalar
+  fallback (`RUST_LLAMA_NO_SIMD=1`). 32 unit tests, all green.
 - **Byte-level BPE** straight from the GGUF file (no network, no downloads).
 - **Sampling** — temperature, top-k, top-p, repetition penalty (windowed,
   once-per-token, matching llama.cpp semantics).
@@ -157,7 +157,7 @@ model.forward_into(&ids, 0, &mut cache, &mut logits);
 ## Contributing
 
 All effort is welcome — kernels, architectures, docs, evals, tooling.
-The codebase is small on purpose: `src/` is ~6k lines, every hot kernel has a
+The codebase is small on purpose: `src/` is ~6.4k lines, every hot kernel has a
 unit test against a scalar reference. Open an issue or PR on GitHub.
 
 ## License

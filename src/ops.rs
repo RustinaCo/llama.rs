@@ -176,6 +176,14 @@ pub fn matmul_batch(w: &Tensor, xs: &[f32], n: usize, ys: &mut [f32]) {
 
     // Quantized: parallelize over row chunks, one dequant buffer per chunk.
     // (Row-disjoint writes go through the module-level `RowWriter`.)
+    //
+    // Rows are processed in blocks of `RBLK`: the block is dequantized once and
+    // then streamed against every activation row in one pass, so the activation
+    // matrix is read `rows / RBLK` times instead of `rows`. That traffic was the
+    // measured limit here (~250 GiB/s of activation reads, i.e. 4 bytes touched
+    // per MAC), and reusing each activation vector for `RBLK` rows cuts it ~3x.
+    // Accumulation order per output is untouched, so results are bit-identical
+    // to the previous one-row-at-a-time code.
 
     // Integer batch path (opt-in via `RUST_LLAMA_BATCH_INT=1`): each
     // activation row is quantized once, then exact integer dots (mirrors the
@@ -233,42 +241,73 @@ pub fn matmul_batch(w: &Tensor, xs: &[f32], n: usize, ys: &mut [f32]) {
     let nt = rayon::current_num_threads().max(1);
     let chunk = (rows / (nt * 4)).max(1);
     let nchunks = rows.div_ceil(chunk);
+    // Rows dequantized and streamed per activation pass, and tokens sharing
+    // each weight vector inside one pass.
+    //
+    // `TLK` must stay 4: `dot_multi_rows` is bit-identical to the serial
+    // `dot_multi` only when the trailing tokens (n % TLK) are exactly the same
+    // ones, and `dot_multi` groups by 4. Measured on n=160 prefill: 4/3 is
+    // ~15% faster but rounds differently in the tail; 3/4 is the fastest
+    // bit-identical split (2.4x the batched-matmul time of one row per pass).
+    const RBLK: usize = 3;
+    const TLK: usize = 4;
     (0..nchunks).into_par_iter().for_each(|ci| {
         let base = ci * chunk;
         let end = (base + chunk).min(rows);
-        let mut buf = vec![0f32; cols];
-        for r in base..end {
-            // AVX2 split-dequant when the layout supports it, else scalar.
-            #[cfg(target_arch = "x86_64")]
-            let fast = unsafe {
-                crate::simd::dequant_row(&mut buf, w.ty(), &data[r * rb..r * rb + rb])
-            };
-            #[cfg(not(target_arch = "x86_64"))]
-            let fast = false;
-            if !fast {
-                w.dequant_row(r, &mut buf);
+        let mut buf = vec![0f32; cols * RBLK];
+        let mut r = base;
+        while r < end {
+            let cnt = (end - r).min(RBLK);
+            for j in 0..cnt {
+                // AVX2 split-dequant when the layout supports it, else scalar.
+                #[cfg(target_arch = "x86_64")]
+                let fast = unsafe {
+                    crate::simd::dequant_row(
+                        &mut buf[j * cols..(j + 1) * cols],
+                        w.ty(),
+                        &data[(r + j) * rb..(r + j) * rb + rb],
+                    )
+                };
+                #[cfg(not(target_arch = "x86_64"))]
+                let fast = false;
+                if !fast {
+                    w.dequant_row(r + j, &mut buf[j * cols..(j + 1) * cols]);
+                }
             }
-            // One fused pass over the row for all N tokens (else N passes).
+            // One pass over the activations for the whole block of rows.
             #[cfg(target_arch = "x86_64")]
             {
                 if crate::simd::available() {
-                    // Safety: thread owns rows [base, end) for every k, and
-                    // `base()+r` + k*rows lands on this thread's rows only.
+                    // Safety: thread owns rows [base, end) for every k, and the
+                    // kernel writes exactly rows [r, r + cnt) of every column.
                     unsafe {
-                        crate::simd::dot_multi(&buf, xs, 0, cols, n, out.base().add(r), rows);
+                        crate::simd::dot_multi_rows::<RBLK, TLK>(
+                            &buf,
+                            cols,
+                            xs,
+                            n,
+                            cnt,
+                            out.base().add(r),
+                            rows,
+                        );
                     }
+                    r += cnt;
                     continue;
                 }
             }
-            for k in 0..n {
-                let xk = &xs[k * cols..k * cols + cols];
-                let v = dot(&buf, xk);
-                debug_assert!(k * rows + r < out_len);
-                // Safety: thread owns rows [base, end) for every k.
-                unsafe {
-                    out.write(k * rows + r, v);
+            for j in 0..cnt {
+                let b = &buf[j * cols..(j + 1) * cols];
+                for k in 0..n {
+                    let xk = &xs[k * cols..k * cols + cols];
+                    let v = dot(b, xk);
+                    debug_assert!(k * rows + r + j < out_len);
+                    // Safety: thread owns rows [base, end) for every k.
+                    unsafe {
+                        out.write(k * rows + r + j, v);
+                    }
                 }
             }
+            r += cnt;
         }
     });
 }
