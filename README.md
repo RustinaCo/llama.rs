@@ -38,11 +38,10 @@ machine state — the ratios above held across repeated sessions.*
 | Q4_K_M | 462 MB | 124.5 tok/s | 28.3 tok/s |
 | Q8_0 | 610 MB | 90.3 tok/s | 20.5 tok/s |
 | F32 | 2279 MB | 46.3 tok/s | 6.7 tok/s |
-| Q4_K_M pruned fa/en (109k vocab, tied) | 342 MB | 122.7 tok/s | **31.0 tok/s** |
 
-Smaller quants win twice: less memory traffic per token, and (pruned) fewer
-logits. Differential-tested against llama.cpp: byte-identical greedy output
-on factual prompts (`tools/logits_diff.py` in the sister repo).
+Smaller quants win twice: less memory traffic per token, and (after vocabulary
+pruning) fewer logits. Differential-tested against llama.cpp: byte-identical
+greedy output on factual prompts.
 
 ### Correctness, not just speed
 
@@ -103,7 +102,7 @@ supported family gets its own forward path plus reference tests.
 ## Quickstart
 
 Prebuilt binaries for **Linux (x86-64), Windows (x86-64) and macOS (ARM64)**
-are attached to every [GitHub Release](https://github.com/Rustinaz/llama.rs/releases)
+are attached to every [GitHub Release](https://github.com/RustinaCo/llama.rs/releases)
 — rebuilt by CI on every update, only the newest version is kept. Or build it
 yourself (Rust stable only):
 
@@ -133,7 +132,7 @@ Env toggles: `RUST_LLAMA_NO_SIMD=1` (scalar path), `RUST_LLAMA_NO_INT=1`
 
 ```toml
 [dependencies]
-rust-llama = { git = "https://github.com/Rustinaz/llama.rs" }
+rust-llama = { git = "https://github.com/RustinaCo/llama.rs" }
 ```
 
 ```rust
@@ -146,19 +145,12 @@ let mut logits = vec![0.0; model.cfg.vocab_size];
 model.forward_into(&ids, 0, &mut cache, &mut logits);
 ```
 
-## Models and training (sister project)
-
-Fine-tunes, datasets, training/eval tooling and ready-to-run model files live
-in the companion repo **[`Rustinaz/llama-fa`](https://github.com/Rustinaz/llama-fa)**
-— this repo stays engine-only on purpose (nothing extra).
-
 ## Roadmap
 
-- [x] Core engine, SIMD, prefill batching, prune-vocab, server, SFT tooling
+- [x] Core engine, SIMD, prefill batching, prune-vocab, server
 - [ ] More architectures (Mistral/Gemma/Phi) and quant int-paths
 - [ ] Fused attention, f16 KV cache, ARM NEON port
 - [ ] GPU backend (much later — CPU-first is the point)
-- [ ] Larger-model distillation recipes
 
 ## Contributing
 
@@ -169,12 +161,6 @@ unit test against a scalar reference. Open an issue or PR on GitHub.
 ## License
 
 MIT — see [LICENSE](LICENSE). Build products, ship them, make them better.
-
-## Coming soon
-
-A lightweight Persian–English language model, tuned for this engine, will be
-released separately — watch the [Releases](https://github.com/Rustinaz/llama.rs/releases)
-page.
 
 ## Author
 
