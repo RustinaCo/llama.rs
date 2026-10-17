@@ -24,8 +24,6 @@
 //!   * `prune`: vocabulary pruning (`prune-vocab`) that rewrites a GGUF keeping
 //!     only Latin + Arabic/Persian (+ symbols/emoji) tokens, with remapped ids,
 //!     filtered merges and sliced embedding/output matrices.
-//!   * `tools/data_prep.py`: local-only training-data extraction (opencode
-//!     sessions, Chrome searches, PDFs) for the follow-up LoRA fine-tune.
 //!
 //! v0.3 additions:
 //!   * Batched prompt prefill (`forward_batch` / `matmul_batch`): projection

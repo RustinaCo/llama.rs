@@ -20,8 +20,8 @@
 //!   exactly what [`crate::tokenizer::Tokenizer`] would skip on load anyway.
 //! * Every `*_token_id` metadata key (bos/eos/pad/...) is remapped.
 //!
-//! Note: a pruned model still needs a short LoRA fine-tune to recover quality
-//! (see `tools/data_prep.py`); pruning alone only removes capacity.
+//! Note: pruning removes model capacity, so a pruned model normally needs a
+//! brief recovery fine-tune afterwards; pruning alone only drops unused rows.
 
 use std::collections::HashMap;
 use std::fs::File;
