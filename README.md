@@ -19,11 +19,11 @@ benchmarks.
 
 | | rust-llama | llama.cpp |
 |---|---|---|
-| Binary size | **~1 MB, single file** | ~9.4 MB (binary + 6 shared libs) + full C++ built at compile time |
+| Binary size | **~1 MB, single file (1005 KB)** | ~9.4 MB (binary + 6 shared libs) + full C++ built at compile time |
 | Dependencies | **2 crates** (`memmap2`, `rayon`) | C/C++ toolchain, libclang, CMake, tokio stack… |
-| Generation speed (Qwen3-0.6B-Q4_K_M, i5-10500, 12 threads) | **~24–29 tok/s (≈65–75%)** | ~36–39 tok/s |
-| Prompt processing | **~190–270 tok/s (≈45–55%)** | ~410–470 tok/s |
-| Peak RAM, same workload | **~450 MB** | ~4.4 GB |
+| Generation speed (Qwen3-0.6B-Q4_K_M, i5-10500, 11-12 threads) | **~28–29.5 tok/s (≈90–92%)** | ~31.8–36 tok/s |
+| Prompt processing | **~175–270 tok/s** | ~265–420 tok/s |
+| Peak RAM, same workload | **~447 MB** | ~480–520 MB |
 | Architectures | Qwen3 / Llama family (focused) | dozens (general) |
 | GPU | CPU-only by design | yes |
 | Extras | `prune-vocab`, std-only OpenAI server, `bench`/`profile` | full ecosystem |
@@ -71,13 +71,14 @@ servers are first-class targets — not afterthoughts.
 - **Quantizations** — `F32/F16/BF16`, `Q4_0/Q4_1/Q5_0/Q5_1`, `Q8_0`, `Q4_K/Q5_K/Q6_K`.
 - **Modern transformer** — GQA, NeoX RoPE (precomputed), SwiGLU, per-head
   QK-norm, RMSNorm, tied embeddings, KV cache.
-- **Hand-written AVX2+FMA kernels** — fused dequant-dot, row-blocked batched
-  prefill matmuls (each activation vector feeds several weight rows in one
-  pass), integer Q×Q8 dots, RMSNorm — runtime-dispatched with portable scalar
-  fallback (`RUST_LLAMA_NO_SIMD=1`). 32 unit tests, all green.
+- **Hand-written AVX2+FMA+F16C kernels** — hardware F16C dequantization,
+  fused dequant-dot, vectorized Q8 activation quantization (`quantize_q8_avx2`),
+  row-blocked batched prefill matmuls (each activation vector feeds several weight
+  rows in one pass), integer Q×Q8 dots, RMSNorm — runtime-dispatched with portable
+  scalar fallback (`RUST_LLAMA_NO_SIMD=1`). 32 unit tests, all green.
 - **Byte-level BPE** straight from the GGUF file (no network, no downloads).
-- **Sampling** — temperature, top-k, top-p, repetition penalty (windowed,
-  once-per-token, matching llama.cpp semantics).
+- **Sampling** — zero-allocation greedy fast path, temperature, top-k, top-p,
+  repetition penalty (windowed, once-per-token, matching llama.cpp semantics).
 - **`prune-vocab`** — drop unneeded scripts and shrink embedding tables:
   vocab 151,936 → 109,051, file −82 MB, *byte-identical greedy output*.
 - **`serve`** — OpenAI-compatible HTTP API (`/health`, `/v1/chat/completions`,
