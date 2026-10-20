@@ -113,6 +113,25 @@ impl fmt::Display for GgmlType {
 
 #[inline]
 pub fn f16_to_f32(h: u16) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::simd::available() {
+            return unsafe { f16_to_f32_f16c(h) };
+        }
+    }
+    f16_to_f32_scalar(h)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c")]
+#[inline]
+unsafe fn f16_to_f32_f16c(h: u16) -> f32 {
+    let v = std::arch::x86_64::_mm_cvtsi32_si128(h as i32);
+    let f = std::arch::x86_64::_mm_cvtph_ps(v);
+    std::arch::x86_64::_mm_cvtss_f32(f)
+}
+
+pub fn f16_to_f32_scalar(h: u16) -> f32 {
     let sign = ((h & 0x8000) as u32) << 16;
     let exp = ((h >> 10) & 0x1f) as u32;
     let mant = (h & 0x3ff) as u32;

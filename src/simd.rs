@@ -100,8 +100,110 @@ pub struct Q8Row {
     pub sums16: Vec<i32>,
 }
 
-/// Portable scalar activation quantization (exact output, any CPU).
+/// Quantize activation row into Q8 blocks, using AVX2 when available.
 pub fn quantize_q8(x: &[f32]) -> Q8Row {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if available() {
+            return unsafe { quantize_q8_avx2(x) };
+        }
+    }
+    quantize_q8_scalar(x)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn quantize_q8_avx2(x: &[f32]) -> Q8Row {
+    let nb = x.len() / 32;
+    let mut scales = Vec::with_capacity(nb);
+    let mut qs: Vec<i8> = Vec::with_capacity(nb * 32);
+    let mut sums = Vec::with_capacity(nb);
+    let mut sums16 = Vec::with_capacity(nb * 2);
+
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let ones = _mm_set1_epi16(1);
+
+    for b in 0..nb {
+        let blk_ptr = x.as_ptr().add(b * 32);
+        let v0 = _mm256_loadu_ps(blk_ptr);
+        let v1 = _mm256_loadu_ps(blk_ptr.add(8));
+        let v2 = _mm256_loadu_ps(blk_ptr.add(16));
+        let v3 = _mm256_loadu_ps(blk_ptr.add(24));
+
+        let abs0 = _mm256_andnot_ps(sign_mask, v0);
+        let abs1 = _mm256_andnot_ps(sign_mask, v1);
+        let abs2 = _mm256_andnot_ps(sign_mask, v2);
+        let abs3 = _mm256_andnot_ps(sign_mask, v3);
+
+        let max01 = _mm256_max_ps(abs0, abs1);
+        let max23 = _mm256_max_ps(abs2, abs3);
+        let max_all = _mm256_max_ps(max01, max23);
+
+        let max_lo = _mm256_castps256_ps128(max_all);
+        let max_hi = _mm256_extractf128_ps(max_all, 1);
+        let max_128 = _mm_max_ps(max_lo, max_hi);
+        let max_64 = _mm_max_ps(max_128, _mm_movehl_ps(max_128, max_128));
+        let max_32 = _mm_max_ss(max_64, _mm_shuffle_ps(max_64, max_64, 0x55));
+        let amax = _mm_cvtss_f32(max_32);
+
+        let d = amax / 127.0;
+        let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+        scales.push(d);
+
+        let inv_v = _mm256_set1_ps(inv);
+
+        // Convert 8 floats to 8 int32 with round-to-nearest
+        let q0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, inv_v));
+        let q1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, inv_v));
+        let q2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, inv_v));
+        let q3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, inv_v));
+
+        // Pack 32-bit to 16-bit signed with saturation
+        let pack01 = _mm256_packs_epi32(q0, q1);
+        let pack23 = _mm256_packs_epi32(q2, q3);
+
+        let pack01_perm = _mm256_permute4x64_epi64(pack01, 0xd8);
+        let pack23_perm = _mm256_permute4x64_epi64(pack23, 0xd8);
+
+        // Pack 16-bit to 8-bit signed with saturation
+        let pack_all = _mm256_packs_epi16(pack01_perm, pack23_perm);
+        let pack_all_perm = _mm256_permute4x64_epi64(pack_all, 0xd8);
+
+        let qs_out_ptr: *mut i8 = qs.as_mut_ptr().add(b * 32);
+        _mm256_storeu_si256(qs_out_ptr as *mut __m256i, pack_all_perm);
+        qs.set_len((b + 1) * 32);
+
+        // Compute sums
+        let lo128 = _mm256_castsi256_si128(pack_all_perm);
+        let hi128 = _mm256_extracti128_si256(pack_all_perm, 1);
+
+        let s_lo_16 = _mm_maddubs_epi16(_mm_set1_epi8(1), lo128);
+        let s_lo_32 = _mm_madd_epi16(s_lo_16, ones);
+        let hi64 = _mm_shuffle_epi32(s_lo_32, 0xee);
+        let s_32 = _mm_add_epi32(s_lo_32, hi64);
+        let s_lo = _mm_cvtsi128_si32(_mm_add_epi32(s_32, _mm_shuffle_epi32(s_32, 0x55)));
+
+        let s_hi_16 = _mm_maddubs_epi16(_mm_set1_epi8(1), hi128);
+        let s_hi_32 = _mm_madd_epi16(s_hi_16, ones);
+        let hi64_h = _mm_shuffle_epi32(s_hi_32, 0xee);
+        let s_32_h = _mm_add_epi32(s_hi_32, hi64_h);
+        let s_hi = _mm_cvtsi128_si32(_mm_add_epi32(s_32_h, _mm_shuffle_epi32(s_32_h, 0x55)));
+
+        sums.push(s_lo + s_hi);
+        sums16.push(s_lo);
+        sums16.push(s_hi);
+    }
+
+    Q8Row {
+        scales,
+        qs,
+        sums,
+        sums16,
+    }
+}
+
+/// Portable scalar activation quantization (exact output, any CPU).
+pub fn quantize_q8_scalar(x: &[f32]) -> Q8Row {
     let nb = x.len() / 32;
     let mut scales = Vec::with_capacity(nb);
     let mut qs = Vec::with_capacity(nb * 32);
@@ -160,9 +262,11 @@ unsafe fn hsum(v: __m256) -> f32 {
     let lo = _mm256_castps256_ps128(v);
     let hi = _mm256_extractf128_ps(v, 1);
     let s = _mm_add_ps(lo, hi);
-    let s = _mm_hadd_ps(s, s);
-    let s = _mm_hadd_ps(s, s);
-    _mm_cvtss_f32(s)
+    let hi64 = _mm_movehl_ps(s, s);
+    let s2 = _mm_add_ps(s, hi64);
+    let hi32 = _mm_shuffle_ps(s2, s2, 0x55);
+    let s3 = _mm_add_ss(s2, hi32);
+    _mm_cvtss_f32(s3)
 }
 
 /// `out = a * b - c`, lane-wise (matches the scalar dequant op order).
@@ -422,9 +526,11 @@ unsafe fn hsum_i32(v: __m256i) -> i32 {
     let lo = _mm256_castsi256_si128(v);
     let hi = _mm256_extracti128_si256(v, 1);
     let s = _mm_add_epi32(lo, hi);
-    let s = _mm_hadd_epi32(s, s);
-    let s = _mm_hadd_epi32(s, s);
-    _mm_cvtsi128_si32(s)
+    let hi64 = _mm_shuffle_epi32(s, 0xee);
+    let s2 = _mm_add_epi32(s, hi64);
+    let hi32 = _mm_shuffle_epi32(s2, 0x55);
+    let s3 = _mm_add_epi32(s2, hi32);
+    _mm_cvtsi128_si32(s3)
 }
 
 /// Integer-exact `Q4_K` × int8-activation dot (one 144-byte super-block row
@@ -482,9 +588,11 @@ unsafe fn dot_q4k_q8_avx2(src: &[u8], act: &Q8Row) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn hsum_i32_128(v: __m128i) -> i32 {
-    let s = _mm_hadd_epi32(v, v);
-    let s = _mm_hadd_epi32(s, s);
-    _mm_cvtsi128_si32(s)
+    let hi64 = _mm_shuffle_epi32(v, 0xee);
+    let s = _mm_add_epi32(v, hi64);
+    let hi32 = _mm_shuffle_epi32(s, 0x55);
+    let s2 = _mm_add_epi32(s, hi32);
+    _mm_cvtsi128_si32(s2)
 }
 
 /// Integer-exact `Q6_K` × int8-activation dot.

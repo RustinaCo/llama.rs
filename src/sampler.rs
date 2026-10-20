@@ -58,6 +58,17 @@ impl Sampler {
         if n == 0 {
             return 0;
         }
+        // Fast zero-allocation path for greedy without repetition penalty
+        if params.temperature <= 0.0 && params.repetition_penalty == 1.0 {
+            let mut best = 0usize;
+            for i in 1..n {
+                if logits[i] > logits[best] {
+                    best = i;
+                }
+            }
+            return best as u32;
+        }
+
         let mut probs: Vec<f32> = logits.to_vec();
 
         // repetition penalty
@@ -91,7 +102,7 @@ impl Sampler {
         }
 
         if params.temperature <= 0.0 {
-            // greedy
+            // greedy with repetition penalty applied
             let mut best = 0usize;
             for i in 1..n {
                 if probs[i] > probs[best] {
