@@ -28,6 +28,10 @@ struct Args {
     out: Option<String>,
     host: String,
     port: u16,
+    persistent_memory: bool,
+    memory_path: Option<String>,
+    expert_en: Option<String>,
+    expert_py: Option<String>,
 }
 
 impl Default for Args {
@@ -53,6 +57,10 @@ impl Default for Args {
             out: None,
             host: "127.0.0.1".to_string(),
             port: 8080,
+            persistent_memory: false,
+            memory_path: None,
+            expert_en: None,
+            expert_py: None,
         }
     }
 }
@@ -83,7 +91,11 @@ OPTIONS (run):
         --seed <N>            RNG seed
         --raw                 Do not apply the chat template
         --no-think            Disable Qwen3 thinking preamble
-    -i, --interactive         Interactive chat loop
+    -i, --interactive         Interactive chat loop (session memory active by default)
+        --memory              Enable persistent cross-session memory (stored in file)
+        --memory-file <PATH>  Custom path for persistent memory file
+        --expert-en <PATH>    Path to English expert model (for delegation/routing)
+        --expert-py <PATH>    Path to Python expert model (for delegation/routing)
     -h, --help                Show help
 ";
 
@@ -160,6 +172,20 @@ fn parse_args() -> Args {
             "-o" | "--out" => {
                 i += 1;
                 a.out = argv.get(i).cloned();
+            }
+            "--memory" => a.persistent_memory = true,
+            "--memory-file" => {
+                i += 1;
+                a.persistent_memory = true;
+                a.memory_path = argv.get(i).cloned();
+            }
+            "--expert-en" => {
+                i += 1;
+                a.expert_en = argv.get(i).cloned();
+            }
+            "--expert-py" => {
+                i += 1;
+                a.expert_py = argv.get(i).cloned();
             }
             "--host" => {
                 i += 1;
@@ -568,14 +594,146 @@ fn run_once(
     );
 }
 
+fn get_memory_file_path(args: &Args) -> std::path::PathBuf {
+    if let Some(ref p) = args.memory_path {
+        std::path::PathBuf::from(p)
+    } else if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home).join(".rust_llama_memory.json")
+    } else {
+        std::path::PathBuf::from(".rust_llama_memory.json")
+    }
+}
+
+fn load_persistent_memory(path: &std::path::Path) -> String {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        content.trim().to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn append_persistent_memory(path: &std::path::Path, key_info: &str) {
+    let mut current = load_persistent_memory(path);
+    if !current.is_empty() {
+        current.push('\n');
+    }
+    current.push_str(key_info);
+    let _ = std::fs::write(path, current);
+}
+
+fn detect_expert_need(prompt: &str) -> Option<(&'static str, &'static str)> {
+    let lower = prompt.to_lowercase();
+    // Python code requests
+    if lower.contains("def ") || lower.contains("import ") || lower.contains("پایتون") || lower.contains("python") {
+        return Some(("Python", "ماژول تخصصی پایتون (Python-Expert)"));
+    }
+    // English language translation/grammar requests
+    if (lower.contains("انگلیسی") && (lower.contains("ترجمه") || lower.contains("چی میشه") || lower.contains("معادل")))
+        || (prompt.chars().filter(|c| c.is_ascii_alphabetic()).count() > 15 && !lower.contains("سلام")) {
+        return Some(("English", "ماژول تخصصی انگلیسی (English-Expert)"));
+    }
+    None
+}
+
+fn run_interactive_turn(
+    model: &Model,
+    cache: &mut rust_llama::model::KvCache,
+    params: &SamplingParams,
+    args: &Args,
+    turns: &[(&str, &str)],
+    prompt: &str,
+    system_ctx: Option<&str>,
+) -> String {
+    let text = if args.raw {
+        prompt.to_string()
+    } else {
+        rust_llama::tokenizer::format_qwen_multiturn(turns, prompt, system_ctx, args.no_think)
+    };
+    let ids = model.tok.encode(&text);
+    if ids.is_empty() {
+        eprintln!("error: empty prompt after tokenization");
+        return String::new();
+    }
+    eprintln!("prompt tokens: {} (context: {}/{})", ids.len(), ids.len(), cache.max_ctx);
+
+    let t0 = Instant::now();
+    let mut logits = vec![0f32; model.cfg.vocab_size];
+    cache.reset();
+    model.forward_into(&ids, 0, cache, &mut logits);
+    let prompt_ms = t0.elapsed().as_secs_f64();
+
+    let mut sampler = rust_llama::Sampler::new(params.seed);
+    let mut recent = ids.clone();
+    let mut stream = ByteStream::default();
+    let mut response_tokens = Vec::new();
+
+    io::stdout().flush().ok();
+
+    let gen_start = Instant::now();
+    let mut generated = 0usize;
+    for _ in 0..args.max_tokens {
+        let next = sampler.sample(&logits, params, &recent);
+        if next == model.tok.eos_id {
+            break;
+        }
+        stream.push(model, next);
+        recent.push(next);
+        response_tokens.push(next);
+        generated += 1;
+        if cache.len >= cache.max_ctx {
+            eprintln!("\n[context limit reached]");
+            break;
+        }
+        model.forward_into(&[next], cache.len, cache, &mut logits);
+        io::stdout().flush().ok();
+    }
+    stream.flush();
+
+    let gen_s = gen_start.elapsed().as_secs_f64();
+    let tps = if gen_s > 0.0 {
+        generated as f64 / gen_s
+    } else {
+        0.0
+    };
+    println!();
+    eprintln!(
+        "\n[prompt: {} tok in {:.2}s | generated: {} tok in {:.2}s | {:.2} tok/s]",
+        ids.len(),
+        prompt_ms,
+        generated,
+        gen_s,
+        tps
+    );
+
+    // Decode full generated string
+    let mut raw_bytes = Vec::new();
+    for id in response_tokens {
+        raw_bytes.extend(model.tok.token_bytes(id));
+    }
+    String::from_utf8_lossy(&raw_bytes).trim().to_string()
+}
+
 fn interactive(
     model: &Model,
     cache: &mut rust_llama::model::KvCache,
     params: &SamplingParams,
     args: &Args,
 ) {
-    eprintln!("interactive mode - type your message (Ctrl-D to quit)");
+    eprintln!("interactive mode - session memory active by default (commands: /clear, /save <info>, Ctrl-D to quit)");
+    let mem_path = get_memory_file_path(args);
+    let mut persistent_facts = if args.persistent_memory {
+        let loaded = load_persistent_memory(&mem_path);
+        if !loaded.is_empty() {
+            eprintln!("[memory] Loaded persistent facts from {}", mem_path.display());
+        }
+        loaded
+    } else {
+        String::new()
+    };
+
+    let mut history: Vec<(String, String)> = Vec::new();
     let stdin = io::stdin();
+
     loop {
         print!("\n> ");
         io::stdout().flush().ok();
@@ -588,12 +746,80 @@ fn interactive(
                 break;
             }
         }
-        let prompt = line.trim_end().to_string();
+        let prompt = line.trim().to_string();
         if prompt.is_empty() {
             continue;
         }
-        run_once(model, cache, params, args, &prompt, false);
-        cache.reset();
+
+        if prompt == "/clear" {
+            history.clear();
+            cache.reset();
+            eprintln!("[session memory cleared]");
+            continue;
+        }
+
+        if prompt.starts_with("/save ") {
+            let fact = prompt["/save ".len()..].trim();
+            if !fact.is_empty() {
+                append_persistent_memory(&mem_path, fact);
+                if !persistent_facts.is_empty() {
+                    persistent_facts.push('\n');
+                }
+                persistent_facts.push_str(fact);
+                eprintln!("[memory] Saved fact: '{}' -> {}", fact, mem_path.display());
+            }
+            continue;
+        }
+
+        // Modular Expert Router: Check if prompt requires delegation
+        if let Some((domain, expert_desc)) = detect_expert_need(&prompt) {
+            let has_expert = match domain {
+                "Python" => args.expert_py.is_some(),
+                "English" => args.expert_en.is_some(),
+                _ => false,
+            };
+            if !has_expert {
+                println!(
+                    "این بخش از درخواست شما نیازمند {} ماست که در حال حاضر فعال یا نصب نیست. \
+                    برای پاسخ‌گویی دقیق به مباحث {}، لطفاً ماژول تخصصی مربوطه را فعال کنید.",
+                    expert_desc, domain
+                );
+                continue;
+            }
+        }
+
+        // Build system prompt including persistent memory if enabled
+        let mut system_ctx = args.system.clone().unwrap_or_default();
+        if args.persistent_memory && !persistent_facts.is_empty() {
+            if !system_ctx.is_empty() {
+                system_ctx.push('\n');
+            }
+            system_ctx.push_str("اطلاعات مهم از حافظه کاربر:\n");
+            system_ctx.push_str(&persistent_facts);
+        }
+        let sys_opt = if system_ctx.is_empty() { None } else { Some(system_ctx.as_str()) };
+
+        let turns: Vec<(&str, &str)> = history
+            .iter()
+            .map(|(u, a)| (u.as_str(), a.as_str()))
+            .collect();
+
+        let assistant_reply = run_interactive_turn(
+            model,
+            cache,
+            params,
+            args,
+            &turns,
+            &prompt,
+            sys_opt,
+        );
+
+        history.push((prompt, assistant_reply));
+
+        // Keep rolling context if it gets too large (> 6 turns)
+        if history.len() > 6 {
+            history.remove(0);
+        }
     }
 }
 

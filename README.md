@@ -120,13 +120,30 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 ./target/release/rust-llama run Qwen3-0.6B-Q4_K_M.gguf \
     -p "The capital of France is" --temp 0 -t 12
 
-# Interactive chat, benchmark, inspect, prune, serve:
-./target/release/rust-llama run  model.gguf -i
+# Interactive chat (Multi-turn session memory active by default):
+./target/release/rust-llama run model.gguf -i
+
+# Interactive chat with persistent cross-session memory (across restarts):
+./target/release/rust-llama run model.gguf -i --memory
+
+# Modular Expert Routing (Multi-Model Delegation):
+# Delegates to specialized models if available; otherwise gracefully alerts the user:
+./target/release/rust-llama run Rustina-Fa-Expert.gguf -i \
+    --expert-en Rustina-En-Expert.gguf \
+    --expert-py Rustina-Python-Expert.gguf
+
+# Benchmark, inspect, prune, serve:
 ./target/release/rust-llama bench model.gguf -n 64 -t 12
 ./target/release/rust-llama info  model.gguf
 ./target/release/rust-llama prune-vocab in.gguf --out pruned.gguf
 ./target/release/rust-llama serve model.gguf --port 8080
 ```
+
+### Interactive Memory & Modular Routing
+
+- **Session Multi-turn Memory (Default in `-i`):** Remembers conversation context across turns during a session with zero allocation leaks and automatic sliding window. Supports in-chat `/clear` to start fresh.
+- **Persistent Cross-Session Memory (`--memory`):** Saves user facts to a structured external profile file without touching or corrupting model weights (`.gguf`). Use `/save <fact>` during chat to remember user details across restarts.
+- **Modular Expert Delegation:** Enables specialized single-domain models (e.g. Persian, English, Python) to work together. When a user prompt requires an uninstalled expert module, the engine politely guides the user to enable the respective expert package.
 
 Env toggles: `RUST_LLAMA_NO_SIMD=1` (scalar path), `RUST_LLAMA_NO_INT=1`
 (fused-f32 instead of integer dots), `RUST_LLAMA_BATCH_INT=1` (integer prefill).

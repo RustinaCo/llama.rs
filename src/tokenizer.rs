@@ -383,7 +383,8 @@ pub fn decode_token_bytes(s: &str) -> Vec<u8> {
 }
 
 /// Minimal Qwen3 chat prompt formatter.
-pub fn format_qwen_chat(prompt: &str, system: Option<&str>, no_think: bool) -> String {    let mut s = String::new();
+pub fn format_qwen_chat(prompt: &str, system: Option<&str>, no_think: bool) -> String {
+    let mut s = String::new();
     if let Some(sys) = system {
         s.push_str("<|im_start|>system\n");
         s.push_str(sys);
@@ -391,6 +392,35 @@ pub fn format_qwen_chat(prompt: &str, system: Option<&str>, no_think: bool) -> S
     }
     s.push_str("<|im_start|>user\n");
     s.push_str(prompt);
+    s.push_str("<|im_end|>\n<|im_start|>assistant\n");
+    if no_think {
+        s.push_str("<think>\n\n</think>\n\n");
+    }
+    s
+}
+
+/// Format multiple turns of user and assistant messages for Qwen3.
+pub fn format_qwen_multiturn(
+    turns: &[(&str, &str)],
+    current_prompt: &str,
+    system: Option<&str>,
+    no_think: bool,
+) -> String {
+    let mut s = String::new();
+    if let Some(sys) = system {
+        s.push_str("<|im_start|>system\n");
+        s.push_str(sys);
+        s.push_str("<|im_end|>\n");
+    }
+    for &(role, content) in turns {
+        s.push_str("<|im_start|>");
+        s.push_str(role);
+        s.push('\n');
+        s.push_str(content);
+        s.push_str("<|im_end|>\n");
+    }
+    s.push_str("<|im_start|>user\n");
+    s.push_str(current_prompt);
     s.push_str("<|im_end|>\n<|im_start|>assistant\n");
     if no_think {
         s.push_str("<think>\n\n</think>\n\n");
