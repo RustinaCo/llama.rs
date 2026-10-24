@@ -788,8 +788,22 @@ fn interactive(
             }
         }
 
-        // Build system prompt including persistent memory if enabled
+        // Build system prompt including Rustina Brand Identity, author attribution, and memory
         let mut system_ctx = args.system.clone().unwrap_or_default();
+        if system_ctx.is_empty() {
+            let mut brand_desc = String::from("شما دستیار هوش مصنوعی رسمی برند «راستینا» (Rustina) هستید که توسط سینا خانزاده (Sina Khanzadeh - وب‌سایت: sina-khanzadeh.ir) توسعه داده شده‌اید.\n");
+            let mut active_modules = vec!["ماژول تخصصی زبان فارسی (Rustina Fa-Expert)"];
+            if args.expert_en.is_some() {
+                active_modules.push("ماژول تخصصی زبان انگلیسی (Rustina En-Expert)");
+            }
+            if args.expert_py.is_some() {
+                active_modules.push("ماژول تخصصی کدنویسی پایتون (Rustina Python-Expert)");
+            }
+            brand_desc.push_str(&format!("ماژول‌های فعال در این نشست: {}.\n", active_modules.join(" و ")));
+            brand_desc.push_str("هنگامی که کاربر درباره هویت یا سازنده شما می‌پرسد، با افتخار خود را مدل هوشمند برند راستینا و ساخته شده توسط سینا خانزاده معرفی کنید.");
+            system_ctx = brand_desc;
+        }
+
         if args.persistent_memory && !persistent_facts.is_empty() {
             if !system_ctx.is_empty() {
                 system_ctx.push('\n');
