@@ -25,7 +25,6 @@ use std::time::Duration;
 
 use crate::model::Model;
 use crate::sampler::{Sampler, SamplingParams};
-use crate::tokenizer::format_qwen_chat;
 
 /// Server bind + context configuration.
 pub struct ServerConfig {
@@ -118,10 +117,10 @@ fn dispatch(
                     write_sse_stream(stream, model, cache, &prompt, req.max_tokens, &params)
                 } else {
                     let mut text = String::new();
-                    run_generator(model, cache, &prompt, req.max_tokens, &params, &mut |s| {
+                    let (prompt_toks, comp_toks) = run_generator(model, cache, &prompt, req.max_tokens, &params, &mut |s| {
                         text.push_str(s);
                     });
-                    write_response(stream, 200, "application/json", &format_chat_response(&text))
+                    write_response(stream, 200, "application/json", &format_chat_response(&text, prompt_toks, comp_toks))
                 }
             }
         },
@@ -136,13 +135,20 @@ fn dispatch(
                     write_sse_stream(stream, model, cache, &prompt, max_tokens, &params)
                 } else {
                     let mut text = String::new();
-                    run_generator(model, cache, &prompt, max_tokens, &params, &mut |s| {
+                    let (prompt_toks, comp_toks) = run_generator(model, cache, &prompt, max_tokens, &params, &mut |s| {
                         text.push_str(s);
                     });
-                    write_response(stream, 200, "application/json", &format_completion_response(&text))
+                    write_response(stream, 200, "application/json", &format_completion_response(&text, prompt_toks, comp_toks))
                 }
             }
         },
+        ("OPTIONS", _) => {
+            write!(
+                stream,
+                "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nConnection: close\r\n\r\n"
+            )?;
+            stream.flush()
+        }
         _ if method == "GET" || method == "POST" => {
             write_response(stream, 404, "application/json", &error_json("not found"))
         }
@@ -162,11 +168,12 @@ fn run_generator(
     max_tokens: usize,
     params: &SamplingParams,
     emit: &mut dyn FnMut(&str),
-) -> usize {
+) -> (usize, usize) {
     let ids = model.tok.encode(prompt_text);
     if ids.is_empty() {
-        return 0;
+        return (0, 0);
     }
+    let prompt_tokens = ids.len();
     cache.reset();
     let mut logits = vec![0f32; model.cfg.vocab_size];
     model.forward_into(&ids, 0, cache, &mut logits);
@@ -204,7 +211,7 @@ fn run_generator(
     if !pending.is_empty() {
         emit(&String::from_utf8_lossy(&pending));
     }
-    n
+    (prompt_tokens, n)
 }
 
 /// True streaming: chunked transfer encoding, one SSE event per model slice,
@@ -218,7 +225,7 @@ fn write_sse_stream(
     params: &SamplingParams,
 ) -> std::io::Result<()> {
     stream.write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
     )?;
     stream.flush()?;
     let mut failed: Option<std::io::Error> = None;
@@ -249,22 +256,38 @@ fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
 
 // --- chat prompt mapping ---
 
-/// System message (first only) -> Qwen template; user/assistant turns
-/// concatenated as the user text (assistant history folded in for context).
+/// System message -> Qwen template; user/assistant turns formatted with proper role tags.
 fn build_chat_prompt_text(messages: &[(String, String)]) -> String {
-    let mut system: Option<&str> = None;
-    let mut user = String::new();
+    let mut s = String::new();
+    let mut last_was_user = false;
+
     for (role, content) in messages {
-        if role == "system" && system.is_none() {
-            system = Some(content);
-            continue;
+        let r = role.trim();
+        if r == "system" {
+            s.push_str("<|im_start|>system\n");
+            s.push_str(content.trim());
+            s.push_str("<|im_end|>\n");
+            last_was_user = false;
+        } else if r == "assistant" {
+            s.push_str("<|im_start|>assistant\n");
+            s.push_str(content.trim());
+            s.push_str("<|im_end|>\n");
+            last_was_user = false;
+        } else {
+            // treat anything else as user
+            s.push_str("<|im_start|>user\n");
+            s.push_str(content.trim());
+            s.push_str("<|im_end|>\n");
+            last_was_user = true;
         }
-        if !user.is_empty() {
-            user.push_str("\n\n");
-        }
-        user.push_str(content);
     }
-    format_qwen_chat(&user, system, false)
+
+    if !last_was_user {
+        // If there was no trailing user message, we shouldn't prompt an empty assistant,
+        // but typically the client ends with a user message.
+    }
+    s.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    s
 }
 
 // --- minimal HTTP/1.1 parsing (request line, headers, Content-Length, body) ---
@@ -363,7 +386,7 @@ fn write_response(
     };
     write!(
         stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )?;
     stream.flush()
@@ -756,15 +779,24 @@ fn json_escape(s: &str) -> String {
     o
 }
 
-fn format_chat_response(content: &str) -> String {
+fn format_chat_response(content: &str, prompt_tokens: usize, completion_tokens: usize) -> String {
     format!(
-        "{{\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}}}}]}}",
-        json_escape(content)
+        "{{\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}}}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
+        json_escape(content),
+        prompt_tokens,
+        completion_tokens,
+        prompt_tokens + completion_tokens
     )
 }
 
-fn format_completion_response(content: &str) -> String {
-    format!("{{\"choices\":[{{\"text\":\"{}\"}}]}}", json_escape(content))
+fn format_completion_response(content: &str, prompt_tokens: usize, completion_tokens: usize) -> String {
+    format!(
+        "{{\"choices\":[{{\"text\":\"{}\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}}}",
+        json_escape(content),
+        prompt_tokens,
+        completion_tokens,
+        prompt_tokens + completion_tokens
+    )
 }
 
 /// One SSE chunk carrying a content delta. Pure + tested.
@@ -827,8 +859,8 @@ mod tests {
         let c = format_sse_chunk("he\"llo\n");
         assert!(c.starts_with("data: ") && c.ends_with("\n\n"));
         assert!(c.contains(r#"content":"he\"llo\n""#));
-        let r = format_chat_response("a\"b");
-        assert!(r.contains(r#""role":"assistant""#) && r.contains(r#"content":"a\"b""#));
+        let r = format_chat_response("a\"b", 5, 10);
+        assert!(r.contains(r#""role":"assistant""#) && r.contains(r#"content":"a\"b""#) && r.contains(r#""prompt_tokens":5"#));
     }
 
     #[test]
