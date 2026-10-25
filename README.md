@@ -116,27 +116,27 @@ cargo build --release
 # AVX2 kernels are runtime-dispatched either way):
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 
-# Chat with a model:
-./target/release/rust-llama run Qwen3-0.6B-Q4_K_M.gguf \
-    -p "The capital of France is" --temp 0 -t 12
+# Chat with the official Persian expert model:
+./target/release/rust-llama run Rustina-V1-Fa-Q4_K_M.gguf \
+    -p "پایتخت فرانسه کجاست؟" --temp 0 -t 12
 
 # Interactive chat (Multi-turn session memory active by default):
-./target/release/rust-llama run model.gguf -i
+./target/release/rust-llama run Rustina-V1-Fa-Q4_K_M.gguf -i
 
 # Interactive chat with persistent cross-session memory (across restarts):
-./target/release/rust-llama run model.gguf -i --memory
+./target/release/rust-llama run Rustina-V1-Fa-Q4_K_M.gguf -i --memory
 
 # Modular Expert Routing (Multi-Model Delegation):
 # Delegates to specialized models if available; otherwise gracefully alerts the user:
-./target/release/rust-llama run Rustina-Fa-Expert.gguf -i \
-    --expert-en Rustina-En-Expert.gguf \
-    --expert-py Rustina-Python-Expert.gguf
+./target/release/rust-llama run Rustina-V1-Fa-Q4_K_M.gguf -i \
+    --expert-en Rustina-V1-En-Q4_K_M.gguf \
+    --expert-py Rustina-V1-Python-Q4_K_M.gguf
 
 # Benchmark, inspect, prune, serve:
-./target/release/rust-llama bench model.gguf -n 64 -t 12
-./target/release/rust-llama info  model.gguf
+./target/release/rust-llama bench Rustina-V1-Fa-Q4_K_M.gguf -n 64 -t 12
+./target/release/rust-llama info  Rustina-V1-Fa-Q4_K_M.gguf
 ./target/release/rust-llama prune-vocab in.gguf --out pruned.gguf
-./target/release/rust-llama serve model.gguf --port 8080
+./target/release/rust-llama serve Rustina-V1-Fa-Q4_K_M.gguf --port 8080
 ```
 
 ### Interactive Memory & Modular Routing
