@@ -119,6 +119,7 @@ fn dispatch(
                     let mut text = String::new();
                     let (prompt_toks, comp_toks) = run_generator(model, cache, &prompt, req.max_tokens, &params, &mut |s| {
                         text.push_str(s);
+                        true
                     });
                     write_response(stream, 200, "application/json", &format_chat_response(&text, prompt_toks, comp_toks))
                 }
@@ -137,6 +138,7 @@ fn dispatch(
                     let mut text = String::new();
                     let (prompt_toks, comp_toks) = run_generator(model, cache, &prompt, max_tokens, &params, &mut |s| {
                         text.push_str(s);
+                        true
                     });
                     write_response(stream, 200, "application/json", &format_completion_response(&text, prompt_toks, comp_toks))
                 }
@@ -167,7 +169,7 @@ fn run_generator(
     prompt_text: &str,
     max_tokens: usize,
     params: &SamplingParams,
-    emit: &mut dyn FnMut(&str),
+    emit: &mut dyn FnMut(&str) -> bool,
 ) -> (usize, usize) {
     let ids = model.tok.encode(prompt_text);
     if ids.is_empty() {
@@ -188,22 +190,23 @@ fn run_generator(
         }
         recent.push(next);
         pending.extend(model.tok.token_bytes(next));
+        let mut should_continue = true;
         match std::str::from_utf8(&pending) {
             Ok(s) => {
-                emit(s);
+                should_continue = emit(s);
                 pending.clear();
             }
             Err(e) => {
                 let valid = e.valid_up_to();
                 if valid > 0 {
                     // SAFETY: `valid_up_to` guarantees a valid UTF-8 prefix.
-                    emit(unsafe { std::str::from_utf8_unchecked(&pending[..valid]) });
+                    should_continue = emit(unsafe { std::str::from_utf8_unchecked(&pending[..valid]) });
                     pending.drain(..valid);
                 }
             }
         }
         n += 1;
-        if cache.len >= cache.max_ctx {
+        if !should_continue || cache.len >= cache.max_ctx {
             break;
         }
         model.forward_into(&[next], cache.len, cache, &mut logits);
@@ -231,13 +234,15 @@ fn write_sse_stream(
     let mut failed: Option<std::io::Error> = None;
     run_generator(model, cache, prompt_text, max_tokens, params, &mut |s| {
         if failed.is_some() {
-            return;
+            return false;
         }
         // Slices from the decoder are always char-boundary aligned, so
         // per-slice escaping is boundary-safe.
         if let Err(e) = write_chunk(stream, format_sse_chunk(s).as_bytes()) {
             failed = Some(e);
+            return false;
         }
+        true
     });
     if let Some(e) = failed {
         return Err(e);
