@@ -116,6 +116,12 @@ cargo build --release
 # AVX2 kernels are runtime-dispatched either way):
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 
+### Official Compatible Models ⚡
+
+`rust-llama` is fully optimized and synced for the **Rustina Modular AI Models**:
+- 🇮🇷 **Rustina V1 Fa (Persian Expert):** [github.com/programmer-1998/Rustina-Fa-Model](https://github.com/programmer-1998/Rustina-Fa-Model) — Download `Rustina-V1-Fa-Q4_K_M.gguf` from Releases and run it directly.
+
+```bash
 # Chat with the official Persian expert model:
 ./target/release/rust-llama run Rustina-V1-Fa-Q4_K_M.gguf \
     -p "پایتخت فرانسه کجاست؟" --temp 0 -t 12
