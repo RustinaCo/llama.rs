@@ -291,7 +291,7 @@ fn build_chat_prompt_text(messages: &[(String, String)]) -> String {
         // If there was no trailing user message, we shouldn't prompt an empty assistant,
         // but typically the client ends with a user message.
     }
-    s.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    s.push_str("<|im_start|>assistant\n");
     s
 }
 
