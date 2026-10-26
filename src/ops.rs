@@ -495,6 +495,7 @@ mod tests {
             dims: vec![cols, rows],
             ty: GgmlType::F32,
             offset: 0,
+            file_index: 0,
         };
         let t = Tensor::new(&info, bytes);
         assert!(t.f32_slice().is_some());
@@ -546,6 +547,7 @@ mod tests {
             dims: vec![cols, rows],
             ty: GgmlType::Q4K,
             offset: 0,
+            file_index: 0,
         };
         let t = Tensor::new(&info, &bytes);
         let mut batched = vec![0f32; n * rows];

@@ -58,6 +58,9 @@ struct LayerW {
     attn_q: Weight,
     attn_k: Weight,
     attn_v: Weight,
+    attn_q_bias: Option<Vec<f32>>,
+    attn_k_bias: Option<Vec<f32>>,
+    attn_v_bias: Option<Vec<f32>>,
     attn_q_norm: Option<Vec<f32>>,
     attn_k_norm: Option<Vec<f32>>,
     attn_output: Weight,
@@ -181,11 +184,29 @@ impl Model {
             } else {
                 None
             };
+            let attn_q_bias = if gguf.info(&format!("{p}attn_q.bias")).is_some() {
+                Some(read_f32(&format!("{p}attn_q.bias"))?)
+            } else {
+                None
+            };
+            let attn_k_bias = if gguf.info(&format!("{p}attn_k.bias")).is_some() {
+                Some(read_f32(&format!("{p}attn_k.bias"))?)
+            } else {
+                None
+            };
+            let attn_v_bias = if gguf.info(&format!("{p}attn_v.bias")).is_some() {
+                Some(read_f32(&format!("{p}attn_v.bias"))?)
+            } else {
+                None
+            };
             layers.push(LayerW {
                 attn_norm,
                 attn_q: Weight::new(&gguf, &format!("{p}attn_q.weight"))?,
                 attn_k: Weight::new(&gguf, &format!("{p}attn_k.weight"))?,
                 attn_v: Weight::new(&gguf, &format!("{p}attn_v.weight"))?,
+                attn_q_bias,
+                attn_k_bias,
+                attn_v_bias,
                 attn_q_norm,
                 attn_k_norm,
                 attn_output: Weight::new(&gguf, &format!("{p}attn_output.weight"))?,
@@ -420,6 +441,28 @@ impl Model {
             ops::matmul_batch(&self.tensor(&lw.attn_k), &xb_all, n, &mut k_all);
             ops::matmul_batch(&self.tensor(&lw.attn_v), &xb_all, n, &mut v_all);
 
+            if let Some(qb) = &lw.attn_q_bias {
+                for i in 0..n {
+                    for j in 0..q_dim {
+                        q_all[i * q_dim + j] += qb[j];
+                    }
+                }
+            }
+            if let Some(kb) = &lw.attn_k_bias {
+                for i in 0..n {
+                    for j in 0..kv_dim {
+                        k_all[i * kv_dim + j] += kb[j];
+                    }
+                }
+            }
+            if let Some(vb) = &lw.attn_v_bias {
+                for i in 0..n {
+                    for j in 0..kv_dim {
+                        v_all[i * kv_dim + j] += vb[j];
+                    }
+                }
+            }
+
             if let (Some(qn), Some(kn)) = (&lw.attn_q_norm, &lw.attn_k_norm) {
                 for i in 0..n {
                     for h in 0..n_head {
@@ -580,6 +623,22 @@ impl Model {
             ops::matmul(&self.tensor(&lw.attn_k), &ws.xb, &mut ws.k);
             ops::matmul(&self.tensor(&lw.attn_v), &ws.xb, &mut ws.v);
 
+            if let Some(qb) = &lw.attn_q_bias {
+                for (a, &b) in ws.q.iter_mut().zip(qb.iter()) {
+                    *a += b;
+                }
+            }
+            if let Some(kb) = &lw.attn_k_bias {
+                for (a, &b) in ws.k.iter_mut().zip(kb.iter()) {
+                    *a += b;
+                }
+            }
+            if let Some(vb) = &lw.attn_v_bias {
+                for (a, &b) in ws.v.iter_mut().zip(vb.iter()) {
+                    *a += b;
+                }
+            }
+
             if let (Some(qn), Some(kn)) = (&lw.attn_q_norm, &lw.attn_k_norm) {
                 for h in 0..n_head {
                     ops::rmsnorm_head(&mut ws.q[h * hd..(h + 1) * hd], qn, eps);
@@ -733,7 +792,7 @@ fn bad(k: &str) -> io::Error {
 /// SPM tokenizers...). New families are added by user demand, each with its
 /// own forward path and reference tests — never by relaxing this gate.
 fn check_arch(arch: &str) -> io::Result<()> {
-    const SUPPORTED: &[&str] = &["qwen3"];
+    const SUPPORTED: &[&str] = &["qwen3", "qwen2"];
     if SUPPORTED.contains(&arch) {
         return Ok(());
     }
@@ -753,9 +812,10 @@ mod arch_tests {
     use super::check_arch;
 
     #[test]
-    fn allowlist_accepts_qwen3_only() {
+    fn allowlist_accepts_qwen_families() {
         assert!(check_arch("qwen3").is_ok());
-        for other in ["llama", "mistral", "gemma", "phi3", "deepseek_v3", "qwen2", ""] {
+        assert!(check_arch("qwen2").is_ok());
+        for other in ["llama", "mistral", "gemma", "phi3", "deepseek_v3", ""] {
             assert!(check_arch(other).is_err(), "{other} must be refused loudly");
         }
     }

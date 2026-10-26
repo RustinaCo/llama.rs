@@ -32,6 +32,10 @@ pub enum MetaValue {
 impl MetaValue {
     pub fn as_u32(&self) -> Option<u32> {
         match self {
+            MetaValue::U8(v) => Some(*v as u32),
+            MetaValue::I8(v) => Some(*v as u32),
+            MetaValue::U16(v) => Some(*v as u32),
+            MetaValue::I16(v) => Some(*v as u32),
             MetaValue::U32(v) => Some(*v),
             MetaValue::U64(v) => Some(*v as u32),
             MetaValue::I32(v) => Some(*v as u32),
@@ -92,6 +96,8 @@ pub struct TensorInfo {
     pub ty: GgmlType,
     /// Byte offset relative to the start of the tensor data section.
     pub offset: usize,
+    /// File index in `mmaps` / `data_offsets` (default 0).
+    pub file_index: usize,
 }
 
 impl TensorInfo {
@@ -120,12 +126,12 @@ impl TensorInfo {
 }
 
 pub struct GgufFile {
-    mmap: Mmap,
+    mmaps: Vec<Mmap>,
     pub version: u32,
     pub metadata: HashMap<String, MetaValue>,
     pub tensors: HashMap<String, TensorInfo>,
     pub tensor_order: Vec<String>,
-    data_offset: usize,
+    data_offsets: Vec<usize>,
 }
 
 struct Cursor<'a> {
@@ -237,79 +243,150 @@ fn align_up(x: usize, a: usize) -> usize {
     }
 }
 
-impl GgufFile {
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = File::open(&path)?;
-        // Safety: the file is only read, never mutated while mapped.
-        let mmap = unsafe { Mmap::map(&file)? };
-        Self::from_mmap(mmap)
+fn parse_header_and_tensors(
+    mmap: &Mmap,
+    file_index: usize,
+) -> io::Result<(u32, HashMap<String, MetaValue>, Vec<(String, TensorInfo)>, usize)> {
+    let mut cur = Cursor::new(mmap);
+    if cur.take(4)? != b"GGUF" {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "gguf: bad magic"));
+    }
+    let version = cur.u32()?;
+    if version < 2 || version > 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("gguf: unsupported version {version}"),
+        ));
+    }
+    let n_tensors = cur.u64()? as usize;
+    let n_kv = cur.u64()? as usize;
+
+    let mut metadata = HashMap::new();
+    for _ in 0..n_kv {
+        let key = cur.string()?;
+        let ty = cur.u32()?;
+        let val = cur.value(ty)?;
+        metadata.insert(key, val);
     }
 
-    pub fn from_mmap(mmap: Mmap) -> io::Result<Self> {
-        let mut cur = Cursor::new(&mmap);
-        if cur.take(4)? != b"GGUF" {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "gguf: bad magic"));
+    let mut tensor_list = Vec::with_capacity(n_tensors);
+    for _ in 0..n_tensors {
+        let name = cur.string()?;
+        let n_dims = cur.u32()? as usize;
+        let mut dims = Vec::new();
+        for _ in 0..n_dims {
+            dims.push(cur.u64()? as usize);
         }
-        let version = cur.u32()?;
-        if version < 2 || version > 3 {
-            return Err(io::Error::new(
+        let raw_ty = cur.u32()?;
+        let offset = cur.u64()? as usize;
+        let ty = GgmlType::from_u32(raw_ty).ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("gguf: unsupported version {version}"),
-            ));
-        }
-        let n_tensors = cur.u64()? as usize;
-        let n_kv = cur.u64()? as usize;
+                format!("gguf: unsupported tensor type {raw_ty} for '{name}'"),
+            )
+        })?;
+        tensor_list.push((
+            name.clone(),
+            TensorInfo {
+                name,
+                dims,
+                ty,
+                offset,
+                file_index,
+            },
+        ));
+    }
 
-        let mut metadata = HashMap::new();
-        for _ in 0..n_kv {
-            let key = cur.string()?;
-            let ty = cur.u32()?;
-            let val = cur.value(ty)?;
-            metadata.insert(key, val);
-        }
+    let alignment = metadata
+        .get("general.alignment")
+        .and_then(|v| v.as_usize())
+        .unwrap_or(32);
+    let data_offset = align_up(cur.pos, alignment);
 
+    Ok((version, metadata, tensor_list, data_offset))
+}
+
+impl GgufFile {
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path_ref = path.as_ref();
+        let file = File::open(path_ref)?;
+        // Safety: the file is only read, never mutated while mapped.
+        let mmap = unsafe { Mmap::map(&file)? };
+
+        let (version, metadata, tensor_list, data_offset) =
+            parse_header_and_tensors(&mmap, 0)?;
+
+        let mut mmaps = vec![mmap];
+        let mut data_offsets = vec![data_offset];
         let mut tensors = HashMap::new();
         let mut tensor_order = Vec::new();
-        for _ in 0..n_tensors {
-            let name = cur.string()?;
-            let n_dims = cur.u32()? as usize;
-            let mut dims = Vec::new();
-            for _ in 0..n_dims {
-                dims.push(cur.u64()? as usize);
-            }
-            let raw_ty = cur.u32()?;
-            let offset = cur.u64()? as usize;
-            let ty = GgmlType::from_u32(raw_ty).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("gguf: unsupported tensor type {raw_ty} for '{name}'"),
-                )
-            })?;
+
+        for (name, info) in tensor_list {
             tensor_order.push(name.clone());
-            tensors.insert(
-                name.clone(),
-                TensorInfo {
-                    name,
-                    dims,
-                    ty,
-                    offset,
-                },
-            );
+            tensors.insert(name, info);
         }
 
-        let alignment = metadata
-            .get("general.alignment")
-            .and_then(|v| v.as_usize())
-            .unwrap_or(32);
-        let data_offset = align_up(cur.pos, alignment);
+        // If split model, automatically discover and load sibling split files
+        if let Some(split_count) = metadata.get("split.count").and_then(|v| v.as_usize()) {
+            if split_count > 1 {
+                let path_str = path_ref.to_string_lossy().to_string();
+                for part_idx in 2..=split_count {
+                    let from_pat = format!("-{:05}-of-{:05}.gguf", 1, split_count);
+                    let to_pat = format!("-{:05}-of-{:05}.gguf", part_idx, split_count);
+                    let sibling_path = if path_str.contains(&from_pat) {
+                        path_str.replace(&from_pat, &to_pat)
+                    } else {
+                        let p1 = format!("-00001-of-0000{}.gguf", split_count);
+                        let p_cur = format!("-{:05}-of-0000{}.gguf", part_idx, split_count);
+                        path_str.replace(&p1, &p_cur)
+                    };
+
+                    let sib_path = Path::new(&sibling_path);
+                    if sib_path.exists() {
+                        let sib_file = File::open(sib_path)?;
+                        let sib_mmap = unsafe { Mmap::map(&sib_file)? };
+                        let cur_file_idx = mmaps.len();
+                        let (_, _, sib_tensors, sib_offset) =
+                            parse_header_and_tensors(&sib_mmap, cur_file_idx)?;
+                        mmaps.push(sib_mmap);
+                        data_offsets.push(sib_offset);
+                        for (name, info) in sib_tensors {
+                            tensor_order.push(name.clone());
+                            tensors.insert(name, info);
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(GgufFile {
-            mmap,
+            mmaps,
             version,
             metadata,
             tensors,
             tensor_order,
-            data_offset,
+            data_offsets,
+        })
+    }
+
+    pub fn from_mmap(mmap: Mmap) -> io::Result<Self> {
+        let (version, metadata, tensor_list, data_offset) =
+            parse_header_and_tensors(&mmap, 0)?;
+
+        let mut tensors = HashMap::new();
+        let mut tensor_order = Vec::new();
+        for (name, info) in tensor_list {
+            tensor_order.push(name.clone());
+            tensors.insert(name, info);
+        }
+
+        Ok(GgufFile {
+            mmaps: vec![mmap],
+            version,
+            metadata,
+            tensors,
+            tensor_order,
+            data_offsets: vec![data_offset],
         })
     }
 
@@ -319,10 +396,7 @@ impl GgufFile {
             .tensors
             .get(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("tensor '{name}'")))?;
-        let start = self.data_offset + info.offset;
-        let end = start + info.nbytes();
-        self.mmap
-            .get(start..end)
+        self.tensor_bytes_info(info)
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, format!("tensor '{name}' out of range")))
     }
 
@@ -331,9 +405,11 @@ impl GgufFile {
     /// This skips the hash-map lookup done by [`GgufFile::tensor_bytes`], which
     /// matters on the hot path where the same tensors are read every token.
     pub fn tensor_bytes_info(&self, info: &TensorInfo) -> Option<&[u8]> {
-        let start = self.data_offset + info.offset;
+        let mmap = self.mmaps.get(info.file_index)?;
+        let data_offset = *self.data_offsets.get(info.file_index)?;
+        let start = data_offset + info.offset;
         let end = start + info.nbytes();
-        self.mmap.get(start..end)
+        mmap.get(start..end)
     }
 
     pub fn info(&self, name: &str) -> Option<&TensorInfo> {
