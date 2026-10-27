@@ -36,6 +36,7 @@
 //! The design goal is a *small, readable* engine that already runs a real
 //! model end-to-end, so perf work can be layered on top later.
 
+pub mod fuzzy;
 pub mod gguf;
 pub mod model;
 pub mod ops;
