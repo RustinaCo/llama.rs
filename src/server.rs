@@ -127,8 +127,8 @@ fn dispatch(
         },
         ("POST", "/v1/completions") => match parse_completion_body(body) {
             Err(msg) => write_response(stream, 400, "application/json", &error_json(msg)),
-            Ok((prompt, max_tokens, stream_out, params)) => {
-                let params = merge_temp(base, params);
+            Ok((prompt, max_tokens, stream_out, temp, top_p, rep_pen)) => {
+                let params = merge_params(base, temp, top_p, rep_pen);
                 if prompt.chars().count() > MAX_PROMPT_CHARS {
                     return write_response(stream, 413, "application/json", &error_json("prompt too long"));
                 }
@@ -692,6 +692,8 @@ fn extract_messages(body: &str) -> Option<Vec<(String, String)>> {
 struct ChatRequest {
     messages: Vec<(String, String)>,
     temperature: Option<f32>,
+    top_p: Option<f32>,
+    repetition_penalty: Option<f32>,
     max_tokens: usize,
     stream: bool,
 }
@@ -701,6 +703,12 @@ impl ChatRequest {
         let mut p = base.clone();
         if let Some(t) = self.temperature {
             p.temperature = t;
+        }
+        if let Some(top_p) = self.top_p {
+            p.top_p = top_p;
+        }
+        if let Some(rep) = self.repetition_penalty {
+            p.repetition_penalty = rep;
         }
         p
     }
@@ -730,6 +738,22 @@ fn get_stream(fields: &[(String, JVal<'_>)]) -> Result<bool, &'static str> {
     }
 }
 
+fn get_top_p(fields: &[(String, JVal<'_>)]) -> Result<Option<f32>, &'static str> {
+    match field(fields, "top_p") {
+        None => Ok(None),
+        Some(JVal::Num(v)) if v.is_finite() && *v > 0.0 && *v <= 1.0 => Ok(Some(*v as f32)),
+        _ => Err("bad top_p (must be a number in (0, 1])"),
+    }
+}
+
+fn get_repetition_penalty(fields: &[(String, JVal<'_>)]) -> Result<Option<f32>, &'static str> {
+    match field(fields, "repetition_penalty") {
+        None => Ok(None),
+        Some(JVal::Num(v)) if v.is_finite() && *v >= 0.0 => Ok(Some(*v as f32)),
+        _ => Err("bad repetition_penalty (must be a non-negative number)"),
+    }
+}
+
 /// Parse a chat-completions body. `Err` message becomes the 400 body.
 fn parse_chat_body(body: &str) -> Result<ChatRequest, &'static str> {
     let fields = object_fields(body).ok_or("invalid json")?;
@@ -740,13 +764,15 @@ fn parse_chat_body(body: &str) -> Result<ChatRequest, &'static str> {
     Ok(ChatRequest {
         messages,
         temperature: get_temperature(&fields)?,
+        top_p: get_top_p(&fields)?,
+        repetition_penalty: get_repetition_penalty(&fields)?,
         max_tokens: get_max_tokens(&fields)?,
         stream: get_stream(&fields)?,
     })
 }
 
-/// Parse a completions body into (prompt, max_tokens, stream, temp-override).
-fn parse_completion_body(body: &str) -> Result<(String, usize, bool, Option<f32>), &'static str> {
+/// Parse a completions body into (prompt, max_tokens, stream, temp-override, top_p, rep_pen).
+fn parse_completion_body(body: &str) -> Result<(String, usize, bool, Option<f32>, Option<f32>, Option<f32>), &'static str> {
     let fields = object_fields(body).ok_or("invalid json")?;
     let prompt = match field(&fields, "prompt") {
         Some(JVal::Str(s)) if !s.is_empty() => s.clone(),
@@ -757,13 +783,21 @@ fn parse_completion_body(body: &str) -> Result<(String, usize, bool, Option<f32>
         get_max_tokens(&fields)?,
         get_stream(&fields)?,
         get_temperature(&fields)?,
+        get_top_p(&fields)?,
+        get_repetition_penalty(&fields)?,
     ))
 }
 
-fn merge_temp(base: &SamplingParams, t: Option<f32>) -> SamplingParams {
+fn merge_params(base: &SamplingParams, t: Option<f32>, top_p: Option<f32>, rep_pen: Option<f32>) -> SamplingParams {
     let mut p = base.clone();
     if let Some(t) = t {
         p.temperature = t;
+    }
+    if let Some(top_p) = top_p {
+        p.top_p = top_p;
+    }
+    if let Some(rep) = rep_pen {
+        p.repetition_penalty = rep;
     }
     p
 }
@@ -915,7 +949,7 @@ mod tests {
         assert!(parse_chat_body(r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":-3}"#).is_err());
         assert!(parse_completion_body(r#"{"prompt":""}"#).is_err());
         assert!(parse_completion_body(r#"{}"#).is_err());
-        let (p, m, s, t) = parse_completion_body(r#"{"prompt":"hi","max_tokens":7,"stream":true,"temperature":0.2}"#).unwrap();
-        assert_eq!((p.as_str(), m, s, t), ("hi", 7, true, Some(0.2)));
+        let (p, m, s, t, top_p, rep) = parse_completion_body(r#"{"prompt":"hi","max_tokens":7,"stream":true,"temperature":0.2,"top_p":0.9,"repetition_penalty":1.15}"#).unwrap();
+        assert_eq!((p.as_str(), m, s, t, top_p, rep), ("hi", 7, true, Some(0.2), Some(0.9), Some(1.15)));
     }
 }
