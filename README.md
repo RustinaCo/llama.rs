@@ -67,7 +67,8 @@ servers are first-class targets — not afterthoughts.
 
 ## Features
 
-- **GGUF v2/v3 reader** — memory-mapped, lazy, zero-copy.
+- **GGUF v2/v3 reader** — memory-mapped, lazy, zero-copy, automatic split-file loading (`-00001-of-00002.gguf`).
+- **Architectures** — Qwen3 & Qwen2 family (verified dense 0.5B–32B with attention bias tensors support).
 - **Quantizations** — `F32/F16/BF16`, `Q4_0/Q4_1/Q5_0/Q5_1`, `Q8_0`, `Q4_K/Q5_K/Q6_K`.
 - **Modern transformer** — GQA, NeoX RoPE (precomputed), SwiGLU, per-head
   QK-norm, RMSNorm, tied embeddings, KV cache.
@@ -75,14 +76,15 @@ servers are first-class targets — not afterthoughts.
   fused dequant-dot, vectorized Q8 activation quantization (`quantize_q8_avx2`),
   row-blocked batched prefill matmuls (each activation vector feeds several weight
   rows in one pass), integer Q×Q8 dots, RMSNorm — runtime-dispatched with portable
-  scalar fallback (`RUST_LLAMA_NO_SIMD=1`). 32 unit tests, all green.
+  scalar fallback (`RUST_LLAMA_NO_SIMD=1`). 35 unit tests, all green.
+- **Native Fuzzy & Text Normalization** — zero-dependency Damerau-Levenshtein distance, typo tolerance, and script normalization for low-latency chat routing and memory matching.
 - **Byte-level BPE** straight from the GGUF file (no network, no downloads).
 - **Sampling** — zero-allocation greedy fast path, temperature, top-k, top-p,
   repetition penalty (windowed, once-per-token, matching llama.cpp semantics).
 - **`prune-vocab`** — drop unneeded scripts and shrink embedding tables:
   vocab 151,936 → 109,051, file −82 MB, *byte-identical greedy output*.
 - **`serve`** — OpenAI-compatible HTTP API (`/health`, `/v1/chat/completions`,
-  `/v1/completions`, SSE streaming), standard library only.
+  `/v1/completions`, SSE streaming, dynamic `top_p` & `repetition_penalty`), standard library only.
 - **`bench` / `profile` / `info` / `tokenize`** — throughput, per-matmul
   breakdown, inspection, and token-id dumps for reference diffing.
 
